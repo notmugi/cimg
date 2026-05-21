@@ -126,7 +126,7 @@ See `cimg --help` and `man cimg` for the full reference.
 | Key / Mouse       | Action                                                       |
 |-------------------|--------------------------------------------------------------|
 | `f`               | Toggle fullscreen                                            |
-| `r`               | Hard reset: zoom, pan, flips, rotation, window size restored |
+| `r`               | Hard reset: zoom, pan, flips, rotation                       |
 | `i`               | Toggle the info overlay (bottom-left)                        |
 | `b`               | Toggle the keybind cheat-sheet (centered)                    |
 | `n`               | Toggle nearest-neighbor sampling (pixel art)                 |
@@ -170,10 +170,11 @@ override it unless you also install a matching `.desktop`.
 
 ## Behavior notes
 
-- **`r` is partial reset**: it clears zoom, pan, flip, rotation, and
-  restores the window to its initial fitted size. It preserves tile
-  mode and aspect-lock state. It does NOT change pause/skim state — if
-  you were paused on frame 4, you stay paused on frame 4.
+- **`r` is partial reset**: it clears zoom, pan, flip, and rotation,
+  and refits the image into the current window. It does NOT resize or
+  move the window — your chosen window size is sticky. Tile mode and
+  aspect-lock state are preserved. Pause/skim state is also preserved
+  — if you were paused on frame 4, you stay paused on frame 4.
 - **Per-image reset**: when navigating with arrows or drag-dropping a
   new file, the view state (zoom, pan, flip, rotate, pause) resets.
   Tile mode is preserved across navigation.

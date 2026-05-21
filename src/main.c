@@ -1833,6 +1833,58 @@ static void release_source_gpu(Viewer *viewer) {
     }
 }
 
+/* Look up the usable bounds of whatever display the window currently
+   sits on, falling back to the primary display, then to a 1080p
+   default if the system doesn't tell us anything sensible. Returns
+   true if the bounds came from a real display, false if it's the
+   fallback (caller usually doesn't care). */
+static bool get_window_display_bounds(SDL_Window *win, SDL_Rect *out) {
+    out->x = 0; out->y = 0; out->w = 1920; out->h = 1080;
+    SDL_DisplayID disp = win ? SDL_GetDisplayForWindow(win) : 0;
+    if (disp == 0) disp = SDL_GetPrimaryDisplay();
+    if (disp == 0) return false;
+    SDL_Rect b;
+    if (!SDL_GetDisplayUsableBounds(disp, &b) || b.w <= 0 || b.h <= 0) {
+        return false;
+    }
+    *out = b;
+    return true;
+}
+
+/* Pick a window size that fits the new image's aspect into roughly
+   the same screen area the current window occupies, capped at the
+   display's usable bounds (minus WINDOW_MARGIN). "Preserve area"
+   keeps the user's coarse size choice — small stays small, big stays
+   big — while the cap kills the death spiral you get when SDL clamps
+   a wrong-aspect window in place across navigations between tall and
+   wide images. Inputs must be > 0; outputs are clamped to >= 1. */
+static void fit_window_to_aspect(int cur_w, int cur_h,
+                                 double new_aspect,
+                                 int disp_w, int disp_h,
+                                 int *out_w, int *out_h) {
+    double area = (double)cur_w * (double)cur_h;
+    double h = sqrt(area / new_aspect);
+    double w = h * new_aspect;
+    int tw = (int)floor(w + 0.5);
+    int th = (int)floor(h + 0.5);
+
+    int cap_w = disp_w > WINDOW_MARGIN ? disp_w - WINDOW_MARGIN : disp_w;
+    int cap_h = disp_h > WINDOW_MARGIN ? disp_h - WINDOW_MARGIN : disp_h;
+    if (tw > cap_w) {
+        tw = cap_w;
+        th = (int)floor((double)cap_w / new_aspect + 0.5);
+    }
+    if (th > cap_h) {
+        th = cap_h;
+        tw = (int)floor((double)cap_h * new_aspect + 0.5);
+    }
+    if (tw < 1) tw = 1;
+    if (th < 1) th = 1;
+
+    *out_w = tw;
+    *out_h = th;
+}
+
 /* Open a new image file in-place, preserving the existing window/renderer.
    Used by drag-and-drop and directory navigation. Returns true on success;
    on failure the previous image (if any) is restored. */
@@ -1882,10 +1934,64 @@ static bool reopen_image(Viewer *viewer, const char *path) {
         viewer->current_size_bytes = (stat(path, &st) == 0) ? (size_t)st.st_size : 0;
     }
 
-    /* Update window title and aspect lock for the new image. */
+    /* Update window title for the new image. */
     SDL_SetWindowTitle(viewer->window,
                        (viewer->opts && viewer->opts->title)
                          ? viewer->opts->title : path);
+
+    /* Refit the window to the new image BEFORE re-applying the aspect
+       lock, then recenter so the window stays anchored on its previous
+       center. Skipping the refit makes navigation between images of
+       different aspects spiral the window smaller: SDL clamps the new
+       aspect into the old bounds, shrinking one axis; the next image
+       then shrinks the other. fit_window_to_aspect() preserves the
+       window's current area (so "small stays small, big stays big")
+       and caps at the display's usable bounds (kills the spiral).
+       Fullscreen windows are left untouched. */
+    if (viewer->window && !viewer->fullscreen
+        && viewer->src.width > 0 && viewer->src.height > 0) {
+        int cur_w = 0, cur_h = 0;
+        SDL_GetWindowSize(viewer->window, &cur_w, &cur_h);
+        if (cur_w > 0 && cur_h > 0) {
+            SDL_Rect db;
+            get_window_display_bounds(viewer->window, &db);
+
+            double new_aspect = (double)viewer->src.width
+                              / (double)viewer->src.height;
+            if (viewer->rotation_steps == 1 || viewer->rotation_steps == 3) {
+                new_aspect = 1.0 / new_aspect;
+            }
+
+            int tw, th;
+            fit_window_to_aspect(cur_w, cur_h, new_aspect,
+                                 db.w, db.h, &tw, &th);
+
+            /* Anchor the resize on the window's current center.
+               SDL_SetWindowSize keeps the top-left pinned by default,
+               so without this the new window jumps up to the old
+               top-left. Capture center, resize, push position back,
+               and clamp inside the usable display bounds so we can't
+               end up off-screen or under a panel. */
+            int old_x = 0, old_y = 0;
+            SDL_GetWindowPosition(viewer->window, &old_x, &old_y);
+            int cx = old_x + cur_w / 2;
+            int cy = old_y + cur_h / 2;
+
+            /* Clear the aspect constraint so SetWindowSize isn't
+               clamped to the previous (wrong) aspect; apply_aspect_lock
+               at the end reinstates it. */
+            SDL_SetWindowAspectRatio(viewer->window, 0.0f, 0.0f);
+            SDL_SetWindowSize(viewer->window, tw, th);
+
+            int nx = cx - tw / 2;
+            int ny = cy - th / 2;
+            if (nx < db.x) nx = db.x;
+            if (ny < db.y) ny = db.y;
+            if (nx + tw > db.x + db.w) nx = db.x + db.w - tw;
+            if (ny + th > db.y + db.h) ny = db.y + db.h - th;
+            SDL_SetWindowPosition(viewer->window, nx, ny);
+        }
+    }
     apply_aspect_lock(viewer);
 
     /* Per-kind GPU resource setup, mirroring create_sdl(). */
@@ -2395,7 +2501,7 @@ typedef struct BindEntry {
 } BindEntry;
 static const BindEntry BINDS[] = {
     {"f",         "Toggle fullscreen"},
-    {"r",         "Reset zoom, pan, flips, rotation, window size"},
+    {"r",         "Reset zoom, pan, flips, rotation"},
     {"i",         "Toggle info overlay"},
     {"b",         "Toggle this keybind list"},
     {"n",         "Toggle nearest-neighbor sampling (pixel art)"},
