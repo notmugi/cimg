@@ -2,9 +2,7 @@
 
 A tiny C image viewer for X11 and Wayland.
 
-`weh` opens an image (or a directory of images) and displays it. No
-menus, no thumbnails, no album mode — just a window with the image in
-it, sized to your screen, that you can pan, zoom, flip, rotate, tile,
+`weh` opens an image (or a directory of images) and displays it. A minimal window with the image in it, sized to your display, that you can pan, zoom, flip, rotate, tile,
 fullscreen, animate, skim, and drag-drop files onto.
 
 ## Features
@@ -15,22 +13,19 @@ fullscreen, animate, skim, and drag-drop files onto.
   animated WebP / animated AVIF** via gdk-pixbuf; **SVG** via librsvg,
   re-rasterized on demand for crispness at any zoom.
 - **Aspect-locked window** that snaps back to the image's aspect during
-  interactive resize, with a graceful black-bar fallback for tilers.
-  Toggleable at runtime.
+  interactive resize, with a black-bar fallback for tiled wms. Toggle with `a`
 - **Smooth pan and zoom** — wheel zoom anchors on whatever you pan to;
-  drag pans 1:1 with the cursor.
-- **Flip and rotate** with `h`, `v`, `k`, `l`.
+  clicking and dragging pans the image.
+- **Flip and rotate** with `h` (horizontal), `v` (vertical), `k` (rotate CCW), `l` (rotate CW).
 - **Tile mode** — repeat the image outward in a grid, with optional
-  mirrored tiling so seams match.
-- **Pixel-art mode** — nearest-neighbor texture sampling toggle.
-- **Animation control** — pause/resume, frame-by-frame skim.
-- **Directory navigation** — launch with a directory and arrow-key
-  through images with wrap-around.
-- **Drag-and-drop** an image or a directory onto the window — even when
-  the window is blank.
-- **Info overlay** — toggle with `i` to see path, size, dimensions,
+  mirrored tiling so seams match. Great for viewing tiled game textures. Toggle with `t`
+- **Pixel-art mode** — nearest-neighbor texture sampling toggle. Toggle with `n`
+- **Animation control** — pause/resume, frame-by-frame skim. Pause with `p` and skim with `-/=`
+- **Directory navigation** — launch with a directory as input or drag it onto the window. navigate with `,` to move backward and `.` to move forward
+- **Drag-and-drop** an image or a directory onto the window to display the image or directory.
+- **Info overlay:** toggle with `i` to see path, size, dimensions,
   format, animation status, current frame, and zoom level.
-- **Lightweight**: pure C, single binary, no vendored libraries.
+- **Binds overlay:** Display all keybinds with the `b` key
 
 ## Build
 
@@ -89,11 +84,12 @@ Open a single image:
 weh image.png
 ```
 
-Open a directory and arrow-key through it:
+Open a directory and navigate through it:
 
 ```sh
 weh ~/Pictures/
 ```
+`,` moves backwards, `.` moves forward.
 
 Launch blank — drop something onto the window to begin:
 
@@ -171,34 +167,13 @@ override it unless you also install a matching `.desktop`.
 ## Behavior notes
 
 - **`r` is partial reset**: it clears zoom, pan, flip, and rotation,
-  and refits the image into the current window. It does NOT resize or
-  move the window — your chosen window size is sticky. Tile mode and
-  aspect-lock state are preserved. Pause/skim state is also preserved
-  — if you were paused on frame 4, you stay paused on frame 4.
+  and refits the image into the current window. Tile mode and
+  aspect-lock state are preserved. Pause/skim state is also preserved; if you were paused on frame 4, it should stay on frame 4.
 - **Per-image reset**: when navigating with arrows or drag-dropping a
   new file, the view state (zoom, pan, flip, rotate, pause) resets.
   Tile mode is preserved across navigation.
-- **Tile zoom** zooms the whole composition (each tile grows together),
-  not individual tiles.
 - **Skim builds a frame cache** on first use. For a typical 500x500x30-frame
   GIF that's ~30MB. The cache is freed when you navigate away.
-
-## Icons and .desktop integration
-
-### Wayland
-
-Wayland's xdg-shell protocol has no `set_icon` request. Compositors
-match the window's `app_id` against a `.desktop` file in the standard
-freedesktop search paths. `make install` puts both `weh.desktop` and
-the icon files in place.
-
-Icon files live under
-`$PREFIX/share/icons/hicolor/scalable/apps/weh.svg` (preferred) and
-`$PREFIX/share/icons/hicolor/SIZExSIZE/apps/weh.png` for the size
-variants `16, 24, 32, 48, 64, 128, 256, 512`.
-
-To supply your own icon, drop files into `dist/icons/` (see
-`dist/icons/README.md`) and re-run `make install`.
 
 ### X11 / XWayland
 
@@ -237,9 +212,6 @@ reading the same hicolor files at startup. This works even without a
 - **Animated images** use SDL3's event-loop timeout to wake at each
   frame's delay; nothing polls. Pause/skim builds a lazy full-frame
   cache only when needed.
-- **Pan + cursor tracking**: pan deltas are computed in window units,
-  not renderer-pixel units, so the image moves 1:1 with the cursor on
-  HiDPI displays.
 
 ## Dependencies (runtime)
 
@@ -254,7 +226,7 @@ formats (`webp-pixbuf-loader`, AVIF loaders, …).
 
 ## License
 
-MIT. See `LICENSE`.
+GPLv3-or-later. See `LICENSE`.
 
 ## Contributing
 
