@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=weh
+GenericName=Image Viewer
+Comment=Tiny C image viewer for X11 and Wayland
+Exec=weh %F
+Icon=weh
+Terminal=false
+NoDisplay=false
+Categories=Graphics;Viewer;2DGraphics;RasterGraphics;VectorGraphics;
+MimeType=image/*;
+StartupWMClass=io.github.notmugi.weh
+StartupNotify=true
+Keywords=image;photo;picture;viewer;

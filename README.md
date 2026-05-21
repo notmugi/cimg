@@ -1,8 +1,8 @@
-# cimg
+# weh
 
 A tiny C image viewer for X11 and Wayland.
 
-`cimg` opens an image (or a directory of images) and displays it. No
+`weh` opens an image (or a directory of images) and displays it. No
 menus, no thumbnails, no album mode — just a window with the image in
 it, sized to your screen, that you can pan, zoom, flip, rotate, tile,
 fullscreen, animate, skim, and drag-drop files onto.
@@ -38,8 +38,8 @@ fullscreen, animate, skim, and drag-drop files onto.
 
 ```sh
 sudo pacman -S base-devel sdl3 gegl babl gdk-pixbuf2 librsvg cairo
-git clone https://github.com/notmugi/cimg
-cd cimg
+git clone https://github.com/notmugi/weh
+cd weh
 make
 ```
 
@@ -67,8 +67,8 @@ sudo make PREFIX=/usr install    # system-wide
 make DESTDIR=/tmp/pkg install    # staged for packaging
 ```
 
-`make install` lays down the binary, the manpage (`cimg.1`), the
-`cimg.desktop` file, and (if present in `dist/icons/`) the icon files
+`make install` lays down the binary, the manpage (`weh.1`), the
+`weh.desktop` file, and (if present in `dist/icons/`) the icon files
 under the freedesktop hicolor tree.
 
 To uninstall:
@@ -80,46 +80,46 @@ sudo make uninstall
 ## Usage
 
 ```sh
-cimg [OPTIONS] [IMAGE|DIRECTORY]
+weh [OPTIONS] [IMAGE|DIRECTORY]
 ```
 
 Open a single image:
 
 ```sh
-cimg image.png
+weh image.png
 ```
 
 Open a directory and arrow-key through it:
 
 ```sh
-cimg ~/Pictures/
+weh ~/Pictures/
 ```
 
 Launch blank — drop something onto the window to begin:
 
 ```sh
-cimg
+weh
 ```
 
 Fullscreen, pixel-art mode, starting zoomed in:
 
 ```sh
-cimg -f -n -z 2.0 sprite.png
+weh -f -n -z 2.0 sprite.png
 ```
 
 Custom title and magenta letterbox:
 
 ```sh
-cimg -t "Reference" --bg=#ff00ff ref.jpg
+weh -t "Reference" --bg=#ff00ff ref.jpg
 ```
 
 Force X11 backend (uses XWayland on a Wayland session):
 
 ```sh
-cimg --x11 image.png
+weh --x11 image.png
 ```
 
-See `cimg --help` and `man cimg` for the full reference.
+See `weh --help` and `man weh` for the full reference.
 
 ## Controls
 
@@ -164,8 +164,8 @@ See `cimg --help` and `man cimg` for the full reference.
 | `--app-id=STR`        | Wayland `app_id` / X11 `WM_CLASS` (default below) |
 | `--bg=#RRGGBB`        | Background / letterbox color (default `#000000`)  |
 
-The default `app_id` is `io.github.notmugi.cimg`. This is the string a
-compositor matches against `cimg.desktop` to pick up the icon, so don't
+The default `app_id` is `io.github.notmugi.weh`. This is the string a
+compositor matches against `weh.desktop` to pick up the icon, so don't
 override it unless you also install a matching `.desktop`.
 
 ## Behavior notes
@@ -189,12 +189,12 @@ override it unless you also install a matching `.desktop`.
 
 Wayland's xdg-shell protocol has no `set_icon` request. Compositors
 match the window's `app_id` against a `.desktop` file in the standard
-freedesktop search paths. `make install` puts both `cimg.desktop` and
+freedesktop search paths. `make install` puts both `weh.desktop` and
 the icon files in place.
 
 Icon files live under
-`$PREFIX/share/icons/hicolor/scalable/apps/cimg.svg` (preferred) and
-`$PREFIX/share/icons/hicolor/SIZExSIZE/apps/cimg.png` for the size
+`$PREFIX/share/icons/hicolor/scalable/apps/weh.svg` (preferred) and
+`$PREFIX/share/icons/hicolor/SIZExSIZE/apps/weh.png` for the size
 variants `16, 24, 32, 48, 64, 128, 256, 512`.
 
 To supply your own icon, drop files into `dist/icons/` (see
@@ -202,7 +202,7 @@ To supply your own icon, drop files into `dist/icons/` (see
 
 ### X11 / XWayland
 
-On X11, `cimg` also pushes the icon directly via `SDL_SetWindowIcon`,
+On X11, `weh` also pushes the icon directly via `SDL_SetWindowIcon`,
 reading the same hicolor files at startup. This works even without a
 `.desktop` file installed.
 
@@ -259,4 +259,4 @@ MIT. See `LICENSE`.
 ## Contributing
 
 Issues and pull requests welcome at
-<https://github.com/notmugi/cimg>.
+<https://github.com/notmugi/weh>.

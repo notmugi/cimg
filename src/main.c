@@ -26,9 +26,9 @@
 #include <strings.h>
 #include <sys/stat.h>
 
-#define APP_NAME    "cimg"
-#define APP_TITLE   "cimg"
-#define APP_ID      "io.github.notmugi.cimg"
+#define APP_NAME    "weh"
+#define APP_TITLE   "weh"
+#define APP_ID      "io.github.notmugi.weh"
 #define APP_VERSION "0.1.0"
 #define WINDOW_MARGIN 64
 #define ZOOM_STEP 1.125
@@ -262,7 +262,7 @@ static void print_usage(FILE *stream) {
         "\n"
         "A tiny image viewer for X11 and Wayland.\n"
         "\n"
-        "If IMAGE is omitted, cimg opens a blank window; drag-drop an image\n"
+        "If IMAGE is omitted, weh opens a blank window; drag-drop an image\n"
         "or a directory onto it to start viewing.\n"
         "\n"
         "Options:\n"
@@ -1740,14 +1740,14 @@ static bool try_load_icon_rgba(const char *path,
 static void try_set_window_icon(Viewer *viewer) {
     static const char *const candidates[] = {
         /* SVG (any size, best fidelity). */
-        "%s/icons/hicolor/scalable/apps/cimg.svg",
+        "%s/icons/hicolor/scalable/apps/weh.svg",
         /* PNGs in descending size order. */
-        "%s/icons/hicolor/512x512/apps/cimg.png",
-        "%s/icons/hicolor/256x256/apps/cimg.png",
-        "%s/icons/hicolor/128x128/apps/cimg.png",
-        "%s/icons/hicolor/64x64/apps/cimg.png",
-        "%s/icons/hicolor/48x48/apps/cimg.png",
-        "%s/icons/hicolor/32x32/apps/cimg.png",
+        "%s/icons/hicolor/512x512/apps/weh.png",
+        "%s/icons/hicolor/256x256/apps/weh.png",
+        "%s/icons/hicolor/128x128/apps/weh.png",
+        "%s/icons/hicolor/64x64/apps/weh.png",
+        "%s/icons/hicolor/48x48/apps/weh.png",
+        "%s/icons/hicolor/32x32/apps/weh.png",
         NULL,
     };
     const char *prefixes[8];

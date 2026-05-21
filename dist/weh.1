@@ -1,13 +1,13 @@
-.\" Manpage for cimg.
-.TH CIMG 1 "2026" "cimg 0.1.0" "User Commands"
+.\" Manpage for weh.
+.TH WEH 1 "2026" "weh 0.1.0" "User Commands"
 .SH NAME
-cimg \- tiny C image viewer for X11 and Wayland
+weh \- tiny C image viewer for X11 and Wayland
 .SH SYNOPSIS
-.B cimg
+.B weh
 [\fIOPTIONS\fR]
 [\fIIMAGE\fR|\fIDIRECTORY\fR]
 .SH DESCRIPTION
-.B cimg
+.B weh
 is a minimal image viewer whose only job is to display an image. It runs
 natively on both X11 and Wayland (via SDL3) and supports a broad range of
 formats:
@@ -24,7 +24,7 @@ crisp at any zoom level.
 The argument is optional. If no
 .I IMAGE
 is given,
-.B cimg
+.B weh
 opens a blank window; drag-drop an image or a directory onto it to start
 viewing. If a
 .I DIRECTORY
@@ -84,7 +84,7 @@ app_id and as the X11 \fIWM_CLASS\fR. This is the string a compositor
 matches against a
 .B .desktop
 file to look up the application icon. Default
-.B io.github.notmugi.cimg .
+.B io.github.notmugi.weh .
 .TP
 .BI \-\-bg = #RRGGBB
 Background and letterbox color, in hex. Default
@@ -189,17 +189,17 @@ The image or directory failed to load.
 Invalid command-line usage.
 .SH FILES
 .TP
-.I $PREFIX/bin/cimg
+.I $PREFIX/bin/weh
 The executable.
 .TP
-.I $PREFIX/share/applications/cimg.desktop
+.I $PREFIX/share/applications/weh.desktop
 The desktop entry used by Wayland compositors to discover the icon
 via the application's
 .B app_id .
 .TP
-.I $PREFIX/share/icons/hicolor/scalable/apps/cimg.svg
+.I $PREFIX/share/icons/hicolor/scalable/apps/weh.svg
 .TQ
-.I $PREFIX/share/icons/hicolor/SIZExSIZE/apps/cimg.png
+.I $PREFIX/share/icons/hicolor/SIZExSIZE/apps/weh.png
 Application icons under the
 .B hicolor
 theme.
@@ -214,10 +214,10 @@ file installed under
 and read the icon from it. The
 .B make install
 target installs both
-.B cimg.desktop
+.B weh.desktop
 and the icon files into the system locations expected by freedesktop. On
 X11,
-.B cimg
+.B weh
 additionally pushes the icon directly via
 .BR SDL_SetWindowIcon ,
 so the icon works without an installed
@@ -230,4 +230,4 @@ file.
 .SH AUTHORS
 notmugi <https://github.com/notmugi>
 .SH BUGS
-Report at <https://github.com/notmugi/cimg/issues>.
+Report at <https://github.com/notmugi/weh/issues>.

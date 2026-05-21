@@ -1,8 +1,8 @@
 #
-# cimg - tiny C image viewer for X11 and Wayland.
+# weh - tiny C image viewer for X11 and Wayland.
 #
 # Build:        make
-# Run:          ./cimg IMAGE
+# Run:          ./weh IMAGE
 # Install:      sudo make install                 (defaults to /usr/local)
 # Uninstall:    sudo make uninstall
 # Override:     make PREFIX=/usr install
@@ -18,7 +18,7 @@ PKGS        := sdl3 gegl-0.4 babl-0.1 gdk-pixbuf-2.0 librsvg-2.0 cairo pangocair
 CPPFLAGS    += $(shell $(PKG_CONFIG) --cflags $(PKGS))
 LDLIBS      += $(shell $(PKG_CONFIG) --libs $(PKGS)) -lm
 
-TARGET      := cimg
+TARGET      := weh
 SRC_MAIN    := src/main.c
 OBJ_MAIN    := build/main.o
 OBJS        := $(OBJ_MAIN)
@@ -46,17 +46,17 @@ clean:
 
 install: $(TARGET)
 	install -Dm755 $(TARGET)             "$(BINDIR)/$(TARGET)"
-	install -Dm644 dist/cimg.1           "$(MANDIR)/cimg.1"
-	install -Dm644 dist/cimg.desktop     "$(APPDIR)/cimg.desktop"
+	install -Dm644 dist/weh.1            "$(MANDIR)/weh.1"
+	install -Dm644 dist/weh.desktop      "$(APPDIR)/weh.desktop"
 	@# Icons (scalable preferred; PNG fallbacks installed if present).
-	@if [ -f dist/icons/cimg.svg ]; then \
-	    install -Dm644 dist/icons/cimg.svg \
-	      "$(ICONBASE)/scalable/apps/cimg.svg"; \
+	@if [ -f dist/icons/weh.svg ]; then \
+	    install -Dm644 dist/icons/weh.svg \
+	      "$(ICONBASE)/scalable/apps/weh.svg"; \
 	fi
 	@for sz in 16 24 32 48 64 128 256 512; do \
-	    if [ -f "dist/icons/$$sz/cimg.png" ]; then \
-	        install -Dm644 "dist/icons/$$sz/cimg.png" \
-	          "$(ICONBASE)/$${sz}x$${sz}/apps/cimg.png"; \
+	    if [ -f "dist/icons/$$sz/weh.png" ]; then \
+	        install -Dm644 "dist/icons/$$sz/weh.png" \
+	          "$(ICONBASE)/$${sz}x$${sz}/apps/weh.png"; \
 	    fi; \
 	done
 	@# Refresh the icon cache if available (best effort).
@@ -69,9 +69,9 @@ install: $(TARGET)
 
 uninstall:
 	rm -f "$(BINDIR)/$(TARGET)"
-	rm -f "$(MANDIR)/cimg.1"
-	rm -f "$(APPDIR)/cimg.desktop"
-	rm -f "$(ICONBASE)/scalable/apps/cimg.svg"
+	rm -f "$(MANDIR)/weh.1"
+	rm -f "$(APPDIR)/weh.desktop"
+	rm -f "$(ICONBASE)/scalable/apps/weh.svg"
 	@for sz in 16 24 32 48 64 128 256 512; do \
-	    rm -f "$(ICONBASE)/$${sz}x$${sz}/apps/cimg.png"; \
+	    rm -f "$(ICONBASE)/$${sz}x$${sz}/apps/weh.png"; \
 	done
