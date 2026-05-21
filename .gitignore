@@ -1,0 +1,10 @@
+build/
+cimg
+*.o
+*.so
+*.a
+*.swp
+.DS_Store
+core
+core.*
+*.tmp

@@ -1,0 +1,232 @@
+.\" Manpage for cimg.
+.TH CIMG 1 "2026" "cimg 0.1.0" "User Commands"
+.SH NAME
+cimg \- tiny C image viewer for X11 and Wayland
+.SH SYNOPSIS
+.B cimg
+[\fIOPTIONS\fR]
+[\fIIMAGE\fR|\fIDIRECTORY\fR]
+.SH DESCRIPTION
+.B cimg
+is a minimal image viewer whose only job is to display an image. It runs
+natively on both X11 and Wayland (via SDL3) and supports a broad range of
+formats:
+.IP \[bu] 2
+Static raster formats supported by GEGL (PNG, JPEG, TIFF, BMP, PSD,
+single-frame WebP and AVIF, PNM, HDR, EXR, TGA, etc.).
+.IP \[bu]
+Animated formats supported by gdk-pixbuf (GIF, APNG, animated WebP,
+animated AVIF if the loader is installed, MNG).
+.IP \[bu]
+SVG, rasterized on demand at the exact target pixel size so it stays
+crisp at any zoom level.
+.PP
+The argument is optional. If no
+.I IMAGE
+is given,
+.B cimg
+opens a blank window; drag-drop an image or a directory onto it to start
+viewing. If a
+.I DIRECTORY
+is given, all openable images in it are listed (sorted case-insensitively
+by basename); the arrow keys navigate the list with wrap-around. If a
+single
+.I IMAGE
+is given, no directory listing is built and the arrow keys do nothing.
+.PP
+The image is fitted inside the window with the original aspect ratio
+preserved. When the window's aspect does not match the image's, the
+non-image area is filled with a configurable background color (default
+black). On compositors that honor it, the window itself is locked to the
+image's aspect ratio.
+.SH OPTIONS
+.TP
+.BR \-h ", " \-\-help
+Show usage information and exit.
+.TP
+.BR \-v ", " \-\-version
+Show version information and exit.
+.TP
+.BR \-f ", " \-\-fullscreen
+Start in fullscreen mode. Equivalent to pressing
+.B f
+once the window is open.
+.TP
+.BR \-n ", " \-\-nearest
+Start with nearest-neighbor texture sampling (pixel-art mode). Equivalent
+to pressing
+.B n
+once the window is open.
+.TP
+.B \-\-no\-aspect\-lock
+Do not request aspect-ratio locking from the compositor. May be toggled
+at runtime with
+.BR a .
+.TP
+.B \-\-x11
+Force SDL to use the X11 video backend. On a Wayland session this routes
+through XWayland. Useful when the Wayland backend misbehaves with a
+particular compositor.
+.TP
+.B \-\-wayland
+Force SDL to use the Wayland video backend (no XWayland fallback).
+.TP
+.BR \-z ", " \-\-zoom = \fIN\fR
+Initial zoom factor. 1.0 means the image is fitted to the window;
+2.0 zooms in 2x, 0.5 zooms out by half. Default 1.0.
+.TP
+.BR \-t ", " \-\-title = \fISTR\fR
+Override the window title. By default the title is the image filename.
+.TP
+.BI \-\-app-id = STR
+Override the application identifier used as the Wayland \fIxdg-shell\fR
+app_id and as the X11 \fIWM_CLASS\fR. This is the string a compositor
+matches against a
+.B .desktop
+file to look up the application icon. Default
+.B io.github.notmugi.cimg .
+.TP
+.BI \-\-bg = #RRGGBB
+Background and letterbox color, in hex. Default
+.B #000000
+(black).
+.SH CONTROLS
+.TP
+.B f
+Toggle fullscreen.
+.TP
+.B r
+Hard reset: zoom to 1.0, recenter on the image, clear flips and rotation,
+and resize the window to the initial fitted size. Tile mode and aspect
+lock are preserved; pause/skim state is preserved.
+.TP
+.B i
+Toggle the info overlay (bottom-left). Shows the full path, file size,
+pixel dimensions, format, animation flag with frame count and current
+frame, current zoom level, and the directory position if applicable.
+.TP
+.B b
+Toggle the keybind cheat-sheet, a centered list of every key and what
+it does. Useful for first-time use.
+.TP
+.B n
+Toggle nearest-neighbor texture sampling. Useful for pixel art; default
+is bilinear.
+.TP
+.B a
+Toggle the WM-aspect-lock at runtime. Initial state is set by
+.B \-\-no\-aspect\-lock .
+.TP
+.B h
+Flip horizontal (toggle).
+.TP
+.B v
+Flip vertical (toggle).
+.TP
+.B k
+Rotate 90 degrees counterclockwise.
+.TP
+.B l
+Rotate 90 degrees clockwise.
+.TP
+.B t
+Toggle tile mode. While on, the image repeats outward from the center,
+forming a grid. The number keys
+.BR 1 \- 9
+choose the tile radius (number of tiles to each side of the center),
+producing a (2N+1)x(2N+1) grid. Default radius is 1 (3x3 grid).
+.TP
+.B w
+Toggle mirrored tiling (only meaningful in tile mode). When on,
+alternating tiles are flipped so seams match perfectly.
+.TP
+.BR 1 \- 9
+In tile mode, sets the tile radius from 1 (3x3) to 9 (19x19).
+.TP
+.B p
+Pause or resume animation playback (animated images only). On the first
+press, the full animation is decoded into RAM so that arbitrary-frame
+skim is instant.
+.TP
+.B \-
+Step to the previous animation frame (animated images only). Implicitly
+pauses playback. Wraps from frame 0 to the last frame.
+.TP
+.B =
+Step to the next animation frame (animated images only). Implicitly
+pauses playback. Wraps from the last frame back to frame 0.
+.TP
+.BR , " / " .
+Previous / next image in the directory list, with wrap-around. Only
+available when launched with a directory argument or after a directory
+is drag-dropped.
+.TP
+.B Home / End
+Jump to the first / last image in the directory list.
+.TP
+.BR q ", " Esc
+Quit.
+.TP
+Mouse wheel
+Zoom in/out around the currently centered point.
+.TP
+Left-drag
+Pan. The image tracks the cursor 1:1.
+.TP
+Drop a file or directory
+Open the dropped path in place. Drag-and-drop works on the blank window
+too.
+.SH EXIT STATUS
+.TP
+.B 0
+Window closed cleanly.
+.TP
+.B 1
+The image or directory failed to load.
+.TP
+.B 2
+Invalid command-line usage.
+.SH FILES
+.TP
+.I $PREFIX/bin/cimg
+The executable.
+.TP
+.I $PREFIX/share/applications/cimg.desktop
+The desktop entry used by Wayland compositors to discover the icon
+via the application's
+.B app_id .
+.TP
+.I $PREFIX/share/icons/hicolor/scalable/apps/cimg.svg
+.TQ
+.I $PREFIX/share/icons/hicolor/SIZExSIZE/apps/cimg.png
+Application icons under the
+.B hicolor
+theme.
+.SH NOTES ON ICONS
+On Wayland there is no protocol mechanism for a client to push its own
+icon. Compositors match the window's
+.I app_id
+against a
+.B .desktop
+file installed under
+.B $XDG_DATA_DIRS/applications
+and read the icon from it. The
+.B make install
+target installs both
+.B cimg.desktop
+and the icon files into the system locations expected by freedesktop. On
+X11,
+.B cimg
+additionally pushes the icon directly via
+.BR SDL_SetWindowIcon ,
+so the icon works without an installed
+.B .desktop
+file.
+.SH SEE ALSO
+.BR feh (1),
+.BR sxiv (1),
+.BR imv (1)
+.SH AUTHORS
+notmugi <https://github.com/notmugi>
+.SH BUGS
+Report at <https://github.com/notmugi/cimg/issues>.
