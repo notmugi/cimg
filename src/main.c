@@ -1,3 +1,15 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * weh - tiny C image viewer for X11 and Wayland.
+ * Copyright (C) 2026 Sean G.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version. See the LICENSE file for the
+ * full license text, or <https://www.gnu.org/licenses/>.
+ */
+
 #include <SDL3/SDL.h>
 #include <gegl.h>
 #include <babl/babl.h>

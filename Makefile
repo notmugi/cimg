@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 #
 # weh - tiny C image viewer for X11 and Wayland.
 #
