@@ -19,8 +19,9 @@ single-frame WebP and AVIF, PNM, HDR, EXR, TGA, etc.).
 Animated formats supported by gdk-pixbuf (GIF, APNG, animated WebP,
 animated AVIF if the loader is installed, MNG).
 .IP \[bu]
-SVG, rasterized on demand at the exact target pixel size so it stays
-crisp at any zoom level.
+SVG, rasterized at load via librsvg into a base texture (capped at
+4096 px on the longest edge), with a worker thread producing sharper
+tiles on demand when the user zooms in.
 .PP
 Arguments are optional. With no argument,
 .B weh

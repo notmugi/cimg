@@ -46,18 +46,24 @@
 #define ZOOM_STEP 1.125
 #define ZOOM_MIN 0.02
 #define ZOOM_MAX 128.0
-/* Maximum raster buffer we will ever produce for an SVG. If the visible
-   region would exceed this, we rasterize at the cap and let SDL bilinearly
-   scale the texture. */
-#define SVG_MAX_RASTER_DIM 4096
+/* SVG tile-pyramid sizing.
 
-/* The always-on low-res backdrop is rasterized once at load. Its long edge
-   is at most this many pixels. SDL bilinearly scales it to whatever the
-   current view requires. */
-#define SVG_BACKDROP_MAX_DIM 1024
-/* After the last interaction event, wait this long before kicking off a
-   final-quality re-rasterization. Keeps wheel/pan smooth. */
-#define SVG_DEBOUNCE_NS  (60ULL * 1000000ULL)  /* 60 ms */
+   Base texture: rasterized once at load. Smaller is faster to load and
+   uses less VRAM, but means the GPU does more bilinear upscaling when
+   the user zooms in. The "sharp tile" below picks up the slack.
+
+   Sharp tile: re-rasterized on demand by a worker thread when the user
+   is zoomed in past base sharpness. Covers only the visible part of
+   the image (plus a small margin for panning) at the exact pixel scale
+   that the current view needs, capped at TILE_MAX_DIM.
+
+   Debounce: wait this long after the last view change (resize / zoom /
+   pan) before kicking off a tile raster job, so dragging the wheel
+   doesn't queue dozens of redundant rasters. */
+#define SVG_BASE_MAX_DIM 4096
+#define SVG_TILE_MAX_DIM 4096
+#define SVG_TILE_PAD_RATIO 0.15      /* extend visible rect by 15% per side */
+#define SVG_DEBOUNCE_NS  (80ULL * 1000000ULL)  /* 80 ms */
 
 typedef enum ImageKind {
     IMG_STATIC,
@@ -71,67 +77,102 @@ typedef struct StaticImage {
     unsigned char *rgba;
 } StaticImage;
 
-/* SVG render plan: describes a sub-region of the SVG's "natural" image
-   coordinate space (in image pixels at scale 1.0) and the scale at which
-   to rasterize it. The rasterized output buffer has size (out_w, out_h)
-   pixels and represents image region
-       [ix, iy, ix + out_w/scale, iy + out_h/scale].
-   When zoomed out, this region covers the entire SVG. When zoomed in,
-   it covers only the visible sub-rect, capped at SVG_MAX_RASTER_DIM. */
-typedef struct SvgPlan {
-    float ix;      /* image-space top-left x (units = SVG user units) */
-    float iy;      /* image-space top-left y                          */
-    float scale;   /* output pixels per SVG user unit                 */
-    int   out_w;   /* output pixels wide                              */
-    int   out_h;   /* output pixels tall                              */
-} SvgPlan;
+/* SVG with two-level pyramid:
+     - BASE: rasterized once at load, capped at SVG_BASE_MAX_DIM. The
+       fields `width`, `height`, `rgba` are aliases for the base raster
+       so the rest of the renderer can treat the SVG as a static image
+       for the always-visible "background" pass.
+     - TILE: optional sharper raster for the current visible region.
+       Produced by a worker thread on demand when the user zooms in
+       past the base resolution. Drawn as an overlay on top of the
+       base only when its generation matches the current view state,
+       so a tile that's about to become stale never tears.
 
+   The worker thread runs the entire SVG lifetime. Generation counter
+   is bumped by the main thread on any view change (zoom / pan / resize
+   / flip / rotation) — the worker stamps each finished job with the
+   generation it was started for, and main thread discards results
+   whose stamp != current generation. This is bulletproof against
+   resize races: the only way for a tile to be drawn is for the worker
+   to have just produced it for the CURRENT view, full stop. */
 typedef struct SvgImage {
-    /* librsvg handle, owned by this struct. RsvgHandle is GObject-style,
-       so we g_object_ref/unref to share with the worker thread (librsvg's
-       handle is read-safe for concurrent renders since 2.36). */
-    RsvgHandle *handle;
-    /* Intrinsic dimensions in user units (CSS pixels), as floats — used
-       directly when computing cairo render scales. */
-    double natural_w_f;
-    double natural_h_f;
-    int natural_w;
-    int natural_h;
+    /* Identity / natural dimensions in SVG user units. */
+    RsvgHandle *handle;            /* kept alive for the worker's renders */
+    double      natural_w_f;
+    double      natural_h_f;
 
-    /* --- backdrop (full image, low-res, rasterized once at load) --- */
-    /* Drawn beneath the sharp clipped buffer so panning never reveals
-       black where the high-quality raster hasn't covered yet. Bilinearly
-       stretched by the GPU; never reraster ed after creation. */
-    unsigned char *backdrop;
-    int            backdrop_w;
-    int            backdrop_h;
-    SDL_Texture   *backdrop_tex; /* lives in renderer; created in create_sdl */
+    /* BASE raster (CPU). Treated as the canonical "image" by the rest
+       of the renderer; `width`, `height`, `rgba` alias the base. */
+    int            width;          /* == base width */
+    int            height;         /* == base height */
+    unsigned char *rgba;           /* == base rgba */
 
-    /* --- shown buffer (owned by main thread) --- */
-    /* The most recent fully-rasterized buffer that the SDL texture
-       currently mirrors. May be smaller than the SVG when zoomed in. */
-    unsigned char *shown;
-    size_t        shown_cap;     /* allocated bytes of `shown` */
-    SvgPlan shown_plan;
+    /* SHARP TILE (GPU). Lives on the renderer; only drawn when valid.
+       Image-space rectangle covered, in SVG user units. */
+    SDL_Texture *tile_tex;
+    int          tile_tex_w;
+    int          tile_tex_h;
+    double       tile_ix, tile_iy, tile_iw, tile_ih;
+    bool         tile_valid;       /* true iff tile_tex contains data for
+                                      the rect above at the current gen */
+    Uint64       tile_generation;  /* gen the tile was rendered for */
 
-    /* --- scratch buffer the worker rasterizes into --- */
-    unsigned char *scratch;
-    size_t scratch_cap;          /* allocated bytes of `scratch` */
-    SvgPlan scratch_plan;        /* plan currently being filled / just filled */
+    /* Worker pipeline. Mutex protects the request slot and the done
+       slot; the worker holds it only briefly at start and end of each
+       job, never during the actual cairo render. */
+    SDL_Thread     *worker;
+    SDL_Mutex      *mu;
+    SDL_Condition  *cv;
+    bool            quit;
+    Uint64          current_generation;  /* bumped on view change (main only) */
 
-    /* --- threading --- */
-    SDL_Thread *worker;
-    SDL_Mutex  *mu;
-    SDL_Condition *cv;           /* worker waits on this */
-    bool job_pending;            /* main → worker: there's a job (plan in pending_plan) */
-    bool job_done;               /* worker → main: scratch is freshly populated */
-    bool quit;                   /* main → worker: exit */
-    SvgPlan pending_plan;        /* the plan the worker should produce next */
+    /* Snapshot of the view-affecting state at the last render, used to
+       detect view changes without instrumenting every mutation site.
+       When any of these change between frames, current_generation is
+       bumped (which invalidates the tile + flips dirty so a re-raster
+       will be queued after the debounce). */
+    int    last_window_w, last_window_h;
+    double last_zoom;
+    double last_anchor_x, last_anchor_y;
+    double last_pan_off_x, last_pan_off_y;
+    int    last_rotation_steps;
+    bool   last_flip_h, last_flip_v;
+    bool   last_tile_on;
+    int    last_tile_radius;
+    bool   last_view_valid;
 
-    /* --- pacing / dirty tracking (main thread only) --- */
-    bool   dirty;
+    /* Pending job — main thread queues the latest desired raster here.
+       Worker pulls when job_pending, latest-wins. */
+    bool   job_pending;
+    Uint64 pending_generation;
+    double pending_ix, pending_iy, pending_iw, pending_ih;
+    int    pending_out_w, pending_out_h;
+
+    /* Debounce window: main thread sets dirty_since_ns on each view
+       change; the request goes out only after the window elapses. */
     Uint64 dirty_since_ns;
-    SvgPlan last_requested_plan; /* what main thread has most recently queued */
+    /* The generation we last enqueued a request for. Compared against
+       current_generation to decide whether a new request is needed. */
+    bool   has_last_requested;
+    Uint64 last_requested_generation;
+    double last_requested_ix, last_requested_iy;
+    double last_requested_iw, last_requested_ih;
+    int    last_requested_out_w, last_requested_out_h;
+
+    /* Two-buffer pipeline. The worker renders into `worker_rgba`; when
+       it finishes it swaps `worker_rgba` <-> `delivered_rgba` under the
+       mutex and sets job_done. Main thread reads `delivered_rgba` and
+       uploads to the GPU. The two never alias, so main's
+       SDL_UpdateTexture and worker's next cairo render can run
+       concurrently without corrupting each other. */
+    bool           job_done;
+    Uint64         done_generation;
+    double         done_ix, done_iy, done_iw, done_ih;
+    int            done_out_w, done_out_h;
+    unsigned char *delivered_rgba;
+    size_t         delivered_cap;
+    unsigned char *worker_rgba;
+    size_t         worker_cap;
 } SvgImage;
 
 typedef struct AnimImage {
@@ -518,8 +559,17 @@ static void cairo_argb32_to_rgba_inplace(unsigned char *buf, int width, int heig
     }
 }
 
-/* Rasterize a sub-region of the SVG into `dst` (out_w * out_h RGBA32).
-   Output is straight (un-premultiplied) RGBA. Returns true on success.
+/* Rasterize a sub-region of the SVG into `dst` (out_w * out_h, 4 bytes
+   per pixel). Output is in cairo's native ARGB32 format: native-endian
+   ARGB with premultiplied alpha. On little-endian (everything we care
+   about) the byte order in memory is B,G,R,A. Callers wanting straight
+   RGBA must call cairo_argb32_to_rgba_inplace() on the result.
+
+   Leaving the conversion as the caller's choice avoids paying for it
+   on the hot path: SDL can sample the cairo buffer directly via
+   SDL_PIXELFORMAT_ARGB32 (== BGRA in memory on LE) with
+   SDL_BLENDMODE_BLEND_PREMULTIPLIED, saving a full pass over the
+   tile pixels (which can be tens of MB).
 
    The image-space region rendered spans:
        x in [ix, ix + out_w/scale)
@@ -582,6 +632,12 @@ static bool svg_render_region(RsvgHandle *handle,
         free(cbuf);
         return false;
     }
+    /* cairo can fail silently and still return ok=true. Check status. */
+    if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(surface);
+        free(cbuf);
+        return false;
+    }
 
     if (need_copy) {
         for (int y = 0; y < out_h; y++) {
@@ -592,93 +648,13 @@ static bool svg_render_region(RsvgHandle *handle,
     }
     cairo_surface_destroy(surface);
     free(cbuf);
-
-    cairo_argb32_to_rgba_inplace(dst, out_w, out_h);
+    /* No conversion here — see header comment. */
     return true;
 }
 
 /* Worker thread: rasterizes whatever plan main thread puts in pending_plan
    into svg->scratch (resized as needed), then signals job_done. Loops until
    svg->quit. */
-static int svg_worker_main(void *userdata) {
-    SvgImage *svg = (SvgImage *)userdata;
-    for (;;) {
-        SDL_LockMutex(svg->mu);
-        while (!svg->job_pending && !svg->quit) {
-            SDL_WaitCondition(svg->cv, svg->mu);
-        }
-        if (svg->quit) {
-            SDL_UnlockMutex(svg->mu);
-            return 0;
-        }
-        SvgPlan plan = svg->pending_plan;
-        svg->job_pending = false;
-        SDL_UnlockMutex(svg->mu);
-
-        /* Allocate / grow the scratch buffer outside the lock. */
-        size_t bytes = (size_t)plan.out_w * (size_t)plan.out_h * 4u;
-        if (bytes > svg->scratch_cap) {
-            unsigned char *grown = realloc(svg->scratch, bytes);
-            if (!grown) {
-                fprintf(stderr, "%s: SVG worker OOM at %dx%d\n",
-                        APP_NAME, plan.out_w, plan.out_h);
-                /* Pretend done with a zero-size plan; main will ignore. */
-                SDL_LockMutex(svg->mu);
-                svg->scratch_plan = (SvgPlan){0};
-                svg->job_done = true;
-                SDL_UnlockMutex(svg->mu);
-                continue;
-            }
-            svg->scratch = grown;
-            svg->scratch_cap = bytes;
-        }
-        svg_render_region(svg->handle,
-                          svg->natural_w_f, svg->natural_h_f,
-                          (double)plan.ix, (double)plan.iy,
-                          (double)plan.scale,
-                          svg->scratch, plan.out_w, plan.out_h);
-
-        SDL_LockMutex(svg->mu);
-        svg->scratch_plan = plan;
-        svg->job_done = true;
-        SDL_UnlockMutex(svg->mu);
-    }
-}
-
-/* Rasterize the entire SVG at a small fixed resolution. Called once on
-   the main thread, before the worker starts. Stores into svg->backdrop. */
-static bool svg_rasterize_backdrop(SvgImage *svg) {
-    double w = svg->natural_w_f;
-    double h = svg->natural_h_f;
-    if (w <= 0.0 || h <= 0.0) return false;
-
-    double long_edge = w > h ? w : h;
-    double scale = 1.0;
-    if (long_edge > (double)SVG_BACKDROP_MAX_DIM) {
-        scale = (double)SVG_BACKDROP_MAX_DIM / long_edge;
-    }
-    int bw = (int)ceil(w * scale);
-    int bh = (int)ceil(h * scale);
-    if (bw < 1) bw = 1;
-    if (bh < 1) bh = 1;
-
-    unsigned char *buf = calloc(1, (size_t)bw * (size_t)bh * 4u);
-    if (!buf) {
-        fprintf(stderr, "%s: out of memory rasterizing SVG backdrop\n", APP_NAME);
-        return false;
-    }
-
-    if (!svg_render_region(svg->handle, w, h, 0.0, 0.0, scale, buf, bw, bh)) {
-        free(buf);
-        return false;
-    }
-
-    svg->backdrop = buf;
-    svg->backdrop_w = bw;
-    svg->backdrop_h = bh;
-    return true;
-}
-
 /* Determine an SVG's natural dimensions in user units. Prefer the
    intrinsic size (CSS width/height) if available, fall back to the
    viewBox, and finally to a sensible default. Returns true on success. */
@@ -719,63 +695,136 @@ static bool svg_get_natural_size(RsvgHandle *handle,
     return true;
 }
 
-static bool load_svg(const char *path, Source *out) {
-    SvgImage svg;
-    memset(&svg, 0, sizeof(svg));
-
-    GError *err = NULL;
-    svg.handle = rsvg_handle_new_from_file(path, &err);
-    if (!svg.handle) {
-        if (err) {
-            fprintf(stderr, "%s: librsvg failed to load '%s': %s\n",
-                    APP_NAME, path, err->message);
-            g_error_free(err);
+/* Load an SVG, rasterize it once at its natural size (clamped to
+   SVG_MAX_RASTER_DIM on the longest edge), and store the resulting
+   RGBA buffer in *out. Returns true on success. After this returns,
+   the renderer treats the SVG identically to a static raster image
+   — there is no worker thread, no re-rasterization on zoom, and the
+   GPU handles upscaling beyond natural size via bilinear filtering. */
+/* Worker thread: pull pending job, render to done_rgba, signal job_done
+   with the stamped generation. Worker holds the lock only at start and
+   end of each job; the cairo render itself runs without the lock so
+   the main thread can keep updating pending_* without blocking. */
+static int svg_worker_main(void *userdata) {
+    SvgImage *svg = (SvgImage *)userdata;
+    for (;;) {
+        SDL_LockMutex(svg->mu);
+        while (!svg->job_pending && !svg->quit) {
+            SDL_WaitCondition(svg->cv, svg->mu);
         }
-        return false;
+        if (svg->quit) {
+            SDL_UnlockMutex(svg->mu);
+            return 0;
+        }
+        /* Snapshot the pending job. */
+        Uint64 gen   = svg->pending_generation;
+        double ix    = svg->pending_ix;
+        double iy    = svg->pending_iy;
+        double iw    = svg->pending_iw;
+        double ih    = svg->pending_ih;
+        int    out_w = svg->pending_out_w;
+        int    out_h = svg->pending_out_h;
+        svg->job_pending = false;
+        /* Take a reference to the handle so a concurrent close can't
+           pull it out from under us. We unref at end of render. */
+        RsvgHandle *handle = svg->handle;
+        if (handle) g_object_ref(handle);
+        SDL_UnlockMutex(svg->mu);
+
+        if (!handle || out_w <= 0 || out_h <= 0 || iw <= 0.0 || ih <= 0.0) {
+            if (handle) g_object_unref(handle);
+            continue;
+        }
+
+        /* Grow worker_rgba as needed. The worker is the sole writer of
+           worker_rgba; main never reads or frees it (only delivered_*).
+           So no lock is needed here. */
+        size_t need = (size_t)out_w * (size_t)out_h * 4u;
+        if (need > svg->worker_cap) {
+            unsigned char *grown = realloc(svg->worker_rgba, need);
+            if (!grown) {
+                fprintf(stderr, "%s: SVG tile worker OOM at %dx%d\n",
+                        APP_NAME, out_w, out_h);
+                g_object_unref(handle);
+                /* Deliver an empty done so main thread can drain the
+                   slot. Swap buffers (delivered_* now empty, worker
+                   keeps its possibly-already-grown buffer). */
+                SDL_LockMutex(svg->mu);
+                svg->done_generation = gen;
+                svg->done_out_w = 0;
+                svg->done_out_h = 0;
+                svg->job_done = true;
+                SDL_UnlockMutex(svg->mu);
+                continue;
+            }
+            svg->worker_rgba = grown;
+            svg->worker_cap  = need;
+        }
+        /* The tile covers image rect [ix, iy, ix+iw, iy+ih] in SVG user
+           units. Scale: out_w / iw (== out_h / ih, modulo rounding). */
+        double scale = (double)out_w / iw;
+        bool ok = svg_render_region(handle, svg->natural_w_f, svg->natural_h_f,
+                                    ix, iy, scale,
+                                    svg->worker_rgba, out_w, out_h);
+        g_object_unref(handle);
+        if (!ok) {
+            /* Render failed (e.g. cairo allocation, broken SVG). Mark
+               an empty done so we don't spin retrying. */
+            SDL_LockMutex(svg->mu);
+            svg->done_generation = gen;
+            svg->done_out_w = 0;
+            svg->done_out_h = 0;
+            svg->job_done = true;
+            SDL_UnlockMutex(svg->mu);
+            continue;
+        }
+
+        /* Successful render: swap worker_rgba <-> delivered_rgba so main
+           can upload from delivered without racing the next render. */
+        SDL_LockMutex(svg->mu);
+        unsigned char *tmp_rgba = svg->delivered_rgba;
+        size_t         tmp_cap  = svg->delivered_cap;
+        svg->delivered_rgba = svg->worker_rgba;
+        svg->delivered_cap  = svg->worker_cap;
+        svg->worker_rgba    = tmp_rgba;
+        svg->worker_cap     = tmp_cap;
+        svg->done_generation = gen;
+        svg->done_ix = ix; svg->done_iy = iy;
+        svg->done_iw = iw; svg->done_ih = ih;
+        svg->done_out_w = out_w;
+        svg->done_out_h = out_h;
+        svg->job_done = true;
+        SDL_UnlockMutex(svg->mu);
     }
+}
 
-    if (!svg_get_natural_size(svg.handle,
-                              &svg.natural_w_f, &svg.natural_h_f)) {
-        g_object_unref(svg.handle);
-        return false;
-    }
-    svg.natural_w = (int)ceil(svg.natural_w_f);
-    svg.natural_h = (int)ceil(svg.natural_h_f);
-    if (svg.natural_w < 1) svg.natural_w = 1;
-    if (svg.natural_h < 1) svg.natural_h = 1;
+/* Main-thread API: queue a tile job. Latest wins (worker may be busy
+   on an earlier request — it'll finish, deliver, and we'll discard). */
+static void svg_request_tile(SvgImage *svg, Uint64 gen,
+                             double ix, double iy, double iw, double ih,
+                             int out_w, int out_h) {
+    SDL_LockMutex(svg->mu);
+    svg->pending_generation = gen;
+    svg->pending_ix = ix; svg->pending_iy = iy;
+    svg->pending_iw = iw; svg->pending_ih = ih;
+    svg->pending_out_w = out_w;
+    svg->pending_out_h = out_h;
+    svg->job_pending = true;
+    SDL_SignalCondition(svg->cv);
+    SDL_UnlockMutex(svg->mu);
 
-    /* Backdrop: one-shot low-res raster of the whole image. Always shown
-       beneath the sharp clipped raster so panning never reveals black. */
-    if (!svg_rasterize_backdrop(&svg)) {
-        g_object_unref(svg.handle);
-        return false;
-    }
-
-    svg.mu = SDL_CreateMutex();
-    svg.cv = SDL_CreateCondition();
-    if (!svg.mu || !svg.cv) {
-        if (svg.cv) SDL_DestroyCondition(svg.cv);
-        if (svg.mu) SDL_DestroyMutex(svg.mu);
-        free(svg.backdrop);
-        g_object_unref(svg.handle);
-        return false;
-    }
-
-    out->kind = IMG_SVG;
-    out->width = svg.natural_w;
-    out->height = svg.natural_h;
-    out->v.svg = svg;
-
-    /* Worker is started AFTER the SvgImage is stored in *out, because we
-       must hand it the pointer that lives in the viewer struct (not a
-       stack copy). The caller (create_sdl) starts the worker. */
-    return true;
+    svg->has_last_requested = true;
+    svg->last_requested_generation = gen;
+    svg->last_requested_ix = ix; svg->last_requested_iy = iy;
+    svg->last_requested_iw = iw; svg->last_requested_ih = ih;
+    svg->last_requested_out_w = out_w;
+    svg->last_requested_out_h = out_h;
 }
 
 static bool svg_start_worker(SvgImage *svg) {
-    svg->worker = SDL_CreateThread(svg_worker_main, "gimp-open-svg", svg);
+    svg->worker = SDL_CreateThread(svg_worker_main, "weh-svg", svg);
     if (!svg->worker) {
-        fprintf(stderr, "%s: failed to start SVG worker thread: %s\n",
+        fprintf(stderr, "%s: failed to start SVG worker: %s\n",
                 APP_NAME, SDL_GetError());
         return false;
     }
@@ -792,50 +841,114 @@ static void svg_stop_worker(SvgImage *svg) {
     svg->worker = NULL;
 }
 
-/* Main-thread API: queue a job. Overwrites any pending job (latest wins).
-   Returns true if the request was newly different from the in-progress one. */
-static void svg_request(SvgImage *svg, const SvgPlan *plan) {
-    SDL_LockMutex(svg->mu);
-    svg->pending_plan = *plan;
-    svg->job_pending = true;
-    svg->last_requested_plan = *plan;
-    SDL_SignalCondition(svg->cv);
-    SDL_UnlockMutex(svg->mu);
+/* Main-thread API: bump generation so any in-flight tile result is
+   discarded. Called on every view-state change. Also clears tile_valid
+   since the previously-uploaded tile no longer corresponds to the
+   current view (it'll get re-validated only if a new tile lands or if
+   the new state happens to still be covered by the same image rect —
+   we don't bother detecting that, the base texture handles it cheaply). */
+static void svg_bump_generation(SvgImage *svg) {
+    svg->current_generation++;
+    svg->tile_valid = false;
+    svg->dirty_since_ns = SDL_GetTicksNS();
 }
 
-/* Main-thread API: try to consume a completed job. If one is ready, swap
-   the scratch buffer into shown and return true (caller should upload to
-   GPU and redraw). Caller passes &out_plan to learn what was just adopted. */
-static bool svg_try_consume(SvgImage *svg, SvgPlan *out_plan) {
-    bool consumed = false;
-    SDL_LockMutex(svg->mu);
-    if (svg->job_done) {
-        /* Swap buffers AND their capacities so each member's *_cap stays
-           consistent with the buffer it currently names. */
-        unsigned char *tb = svg->shown;
-        size_t         tc = svg->shown_cap;
-        svg->shown      = svg->scratch;
-        svg->shown_cap  = svg->scratch_cap;
-        svg->scratch    = tb;
-        svg->scratch_cap = tc;
-        svg->shown_plan = svg->scratch_plan;
-        svg->job_done = false;
-        consumed = true;
-        if (out_plan) *out_plan = svg->shown_plan;
+static bool load_svg(const char *path, Source *out) {
+    GError *err = NULL;
+    RsvgHandle *handle = rsvg_handle_new_from_file(path, &err);
+    if (!handle) {
+        if (err) {
+            fprintf(stderr, "%s: librsvg failed to load '%s': %s\n",
+                    APP_NAME, path, err->message);
+            g_error_free(err);
+        }
+        return false;
     }
-    SDL_UnlockMutex(svg->mu);
-    return consumed;
+
+    double natural_w_f = 0.0, natural_h_f = 0.0;
+    if (!svg_get_natural_size(handle, &natural_w_f, &natural_h_f)) {
+        g_object_unref(handle);
+        return false;
+    }
+
+    /* Base raster: shrink to fit SVG_BASE_MAX_DIM on the long edge,
+       never upscale. */
+    double long_edge = natural_w_f > natural_h_f ? natural_w_f : natural_h_f;
+    double base_scale = 1.0;
+    if (long_edge > (double)SVG_BASE_MAX_DIM) {
+        base_scale = (double)SVG_BASE_MAX_DIM / long_edge;
+    }
+    int bw = (int)ceil(natural_w_f * base_scale);
+    int bh = (int)ceil(natural_h_f * base_scale);
+    if (bw < 1) bw = 1;
+    if (bh < 1) bh = 1;
+
+    unsigned char *base = calloc(1, (size_t)bw * (size_t)bh * 4u);
+    if (!base) {
+        fprintf(stderr, "%s: out of memory rasterizing SVG base '%s' at %dx%d\n",
+                APP_NAME, path, bw, bh);
+        g_object_unref(handle);
+        return false;
+    }
+    if (!svg_render_region(handle, natural_w_f, natural_h_f,
+                           0.0, 0.0, base_scale, base, bw, bh)) {
+        fprintf(stderr, "%s: librsvg failed to rasterize '%s'\n", APP_NAME, path);
+        free(base);
+        g_object_unref(handle);
+        return false;
+    }
+    /* Base goes through the standard RGBA upload path; un-premultiply
+       once at load. */
+    cairo_argb32_to_rgba_inplace(base, bw, bh);
+
+    /* Set up worker primitives. */
+    SDL_Mutex     *mu = SDL_CreateMutex();
+    SDL_Condition *cv = SDL_CreateCondition();
+    if (!mu || !cv) {
+        if (cv) SDL_DestroyCondition(cv);
+        if (mu) SDL_DestroyMutex(mu);
+        free(base);
+        g_object_unref(handle);
+        return false;
+    }
+
+    /* Populate the SVG and start the worker. */
+    SvgImage *svg = &out->v.svg;
+    memset(svg, 0, sizeof(*svg));
+    svg->handle      = handle; /* worker shares it (refcount-bumped per job) */
+    svg->natural_w_f = natural_w_f;
+    svg->natural_h_f = natural_h_f;
+    svg->width  = bw;
+    svg->height = bh;
+    svg->rgba   = base;
+    svg->mu     = mu;
+    svg->cv     = cv;
+    svg->current_generation = 1; /* 0 is reserved for "no tile" */
+
+    out->kind   = IMG_SVG;
+    out->width  = bw;
+    out->height = bh;
+
+    if (!svg_start_worker(svg)) {
+        SDL_DestroyCondition(cv);
+        SDL_DestroyMutex(mu);
+        free(base);
+        g_object_unref(handle);
+        memset(svg, 0, sizeof(*svg));
+        return false;
+    }
+    return true;
 }
 
 static void free_svg(SvgImage *svg) {
     svg_stop_worker(svg);
-    if (svg->backdrop_tex) SDL_DestroyTexture(svg->backdrop_tex);
+    if (svg->tile_tex) SDL_DestroyTexture(svg->tile_tex);
     if (svg->cv) SDL_DestroyCondition(svg->cv);
     if (svg->mu) SDL_DestroyMutex(svg->mu);
     if (svg->handle) g_object_unref(svg->handle);
-    free(svg->backdrop);
-    free(svg->shown);
-    free(svg->scratch);
+    free(svg->rgba);
+    free(svg->delivered_rgba);
+    free(svg->worker_rgba);
     memset(svg, 0, sizeof(*svg));
 }
 
@@ -1686,26 +1799,15 @@ static bool create_sdl(Viewer *viewer, const char *title) {
         break;
     }
     case IMG_SVG: {
+        /* The SVG was already rasterized to a static RGBA buffer in
+           load_svg; upload it like any other static image. */
         SvgImage *svg = &viewer->src.v.svg;
-        /* Upload the one-shot backdrop into its own texture. The sharp
-           texture (viewer->texture) is created lazily in render() once the
-           worker produces a buffer. */
-        svg->backdrop_tex = SDL_CreateTexture(viewer->renderer,
-                                              SDL_PIXELFORMAT_RGBA32,
-                                              SDL_TEXTUREACCESS_STATIC,
-                                              svg->backdrop_w,
-                                              svg->backdrop_h);
-        if (!svg->backdrop_tex) {
-            die_sdl("SDL_CreateTexture (backdrop)");
+        if (!ensure_texture(viewer, svg->width, svg->height)) {
             return false;
         }
-        SDL_SetTextureScaleMode(svg->backdrop_tex, SDL_SCALEMODE_LINEAR);
-        if (!SDL_UpdateTexture(svg->backdrop_tex, NULL,
-                               svg->backdrop, svg->backdrop_w * 4)) {
-            die_sdl("SDL_UpdateTexture (backdrop)");
-            return false;
-        }
-        if (!svg_start_worker(svg)) {
+        if (!SDL_UpdateTexture(viewer->texture, NULL,
+                               svg->rgba, svg->width * 4)) {
+            die_sdl("SDL_UpdateTexture");
             return false;
         }
         break;
@@ -1754,6 +1856,7 @@ static bool try_load_icon_rgba(const char *path,
             g_object_unref(handle);
             return false;
         }
+        cairo_argb32_to_rgba_inplace(buf, w, h);
         g_object_unref(handle);
         *out_rgba = buf; *out_w = w; *out_h = h;
         return true;
@@ -1873,14 +1976,20 @@ static void free_frame_cache(Viewer *viewer) {
     viewer->frames_decoded = false;
 }
 
-/* Drop GPU resources tied to the current Source (textures + SVG bits).
-   Used internally by reopen_image and during teardown. */
+/* Drop GPU resources tied to the current Source. Used internally by
+   reopen_image and during teardown. Also drops the SVG sharp-tile
+   texture (free_svg destroys the tile_tex itself, but this helper is
+   called BEFORE free_svg on the new path's failure-rollback branch,
+   so we proactively destroy here as well). */
 static void release_source_gpu(Viewer *viewer) {
     if (viewer->src.kind == IMG_SVG) {
-        svg_stop_worker(&viewer->src.v.svg);
-        if (viewer->src.v.svg.backdrop_tex) {
-            SDL_DestroyTexture(viewer->src.v.svg.backdrop_tex);
-            viewer->src.v.svg.backdrop_tex = NULL;
+        SvgImage *svg = &viewer->src.v.svg;
+        if (svg->tile_tex) {
+            SDL_DestroyTexture(svg->tile_tex);
+            svg->tile_tex = NULL;
+            svg->tile_tex_w = 0;
+            svg->tile_tex_h = 0;
+            svg->tile_valid = false;
         }
     }
     if (viewer->texture) {
@@ -1949,6 +2058,15 @@ static void fit_window_to_aspect(int cur_w, int cur_h,
 static bool reopen_image(Viewer *viewer, const char *path) {
     release_source_gpu(viewer);
     free_frame_cache(viewer);
+    /* Stop the SVG worker (if any) BEFORE copying the Source struct.
+       The worker was started with a pointer to viewer->src.v.svg; if
+       we let it keep running while we copy the struct out, the worker
+       will read/write a memory slot that's about to be overwritten by
+       load_source, and the stop signal we eventually send will go to
+       the wrong copy. */
+    if (viewer->src.kind == IMG_SVG) {
+        svg_stop_worker(&viewer->src.v.svg);
+    }
     Source old = viewer->src;
     memset(&viewer->src, 0, sizeof(viewer->src));
 
@@ -1975,6 +2093,15 @@ static bool reopen_image(Viewer *viewer, const char *path) {
             }
             break;
         case IMG_SVG:
+            if (ensure_texture(viewer,
+                               viewer->src.v.svg.width,
+                               viewer->src.v.svg.height)) {
+                SDL_UpdateTexture(viewer->texture, NULL,
+                                  viewer->src.v.svg.rgba,
+                                  viewer->src.v.svg.width * 4);
+            }
+            /* We stopped the worker above; restart it now that the
+               SvgImage is back in viewer->src.v.svg. */
             svg_start_worker(&viewer->src.v.svg);
             break;
         }
@@ -2074,17 +2201,10 @@ static bool reopen_image(Viewer *viewer, const char *path) {
         break;
     case IMG_SVG: {
         SvgImage *svg = &viewer->src.v.svg;
-        svg->backdrop_tex = SDL_CreateTexture(viewer->renderer,
-                                              SDL_PIXELFORMAT_RGBA32,
-                                              SDL_TEXTUREACCESS_STATIC,
-                                              svg->backdrop_w,
-                                              svg->backdrop_h);
-        if (svg->backdrop_tex) {
-            SDL_SetTextureScaleMode(svg->backdrop_tex, SDL_SCALEMODE_LINEAR);
-            SDL_UpdateTexture(svg->backdrop_tex, NULL,
-                              svg->backdrop, svg->backdrop_w * 4);
+        if (ensure_texture(viewer, svg->width, svg->height)) {
+            SDL_UpdateTexture(viewer->texture, NULL,
+                              svg->rgba, svg->width * 4);
         }
-        svg_start_worker(svg);
         break;
     }
     }
@@ -2160,34 +2280,6 @@ static bool nav_to(Viewer *viewer, int i) {
     return false;
 }
 
-/* ---------- per-frame geometry helpers ---------- */
-
-static void compute_draw_size(const Viewer *viewer,
-                              int window_w, int window_h,
-                              double *out_draw_w, double *out_draw_h) {
-    double image_aspect = (double)viewer->src.width / (double)viewer->src.height;
-    double window_aspect = (double)window_w / (double)window_h;
-
-    double fit_w, fit_h;
-    if (window_aspect > image_aspect) {
-        fit_h = (double)window_h;
-        fit_w = (double)window_h * image_aspect;
-    } else {
-        fit_w = (double)window_w;
-        fit_h = (double)window_w / image_aspect;
-    }
-
-    double zoom = viewer->zoom;
-    if (zoom <= 0.0 || !isfinite(zoom)) zoom = 1.0;
-
-    double dw = fit_w * zoom;
-    double dh = fit_h * zoom;
-    if (dw < 1.0) dw = 1.0;
-    if (dh < 1.0) dh = 1.0;
-    *out_draw_w = dw;
-    *out_draw_h = dh;
-}
-
 /* ---------- render ---------- */
 
 /* Returns the scale factor for converting window-unit deltas (the units
@@ -2202,210 +2294,6 @@ static void window_to_pixel_scale(const Viewer *viewer,
     SDL_GetCurrentRenderOutputSize(viewer->renderer, &pix_w, &pix_h);
     *out_sx = (win_w > 0) ? (double)pix_w / (double)win_w : 1.0;
     *out_sy = (win_h > 0) ? (double)pix_h / (double)win_h : 1.0;
-}
-
-/* Compute the on-screen rectangle that the full image would occupy at the
-   current view (window dimensions, zoom, anchor, pan offset). Equivalent
-   to the dst rect the previous render used, but separated so SVG can map
-   its sub-region to screen coordinates within this same rect. */
-static void compute_full_image_dst(const Viewer *viewer,
-                                   int window_w, int window_h,
-                                   double *dx, double *dy,
-                                   double *dw, double *dh) {
-    double draw_w, draw_h;
-    compute_draw_size(viewer, window_w, window_h, &draw_w, &draw_h);
-    double sx, sy;
-    window_to_pixel_scale(viewer, &sx, &sy);
-    *dw = draw_w;
-    *dh = draw_h;
-    *dx = (double)window_w * 0.5 - viewer->anchor_x * draw_w
-        + viewer->pan_off_x * sx;
-    *dy = (double)window_h * 0.5 - viewer->anchor_y * draw_h
-        + viewer->pan_off_y * sy;
-}
-
-/* Compute the SVG plan we WANT for the current view: rasterize only the
-   visible part of the image, at a scale equal to the current on-screen
-   pixels-per-image-pixel, capped at SVG_MAX_RASTER_DIM. */
-static SvgPlan svg_plan_for_view(const Viewer *viewer,
-                                 int window_w, int window_h) {
-    const SvgImage *svg = &viewer->src.v.svg;
-    double full_dx, full_dy, full_dw, full_dh;
-    compute_full_image_dst(viewer, window_w, window_h,
-                           &full_dx, &full_dy, &full_dw, &full_dh);
-
-    /* Intersect the full image's on-screen rect with the window viewport
-       to get the visible portion in screen coords. */
-    double vis_x0 = full_dx > 0.0 ? full_dx : 0.0;
-    double vis_y0 = full_dy > 0.0 ? full_dy : 0.0;
-    double vis_x1 = full_dx + full_dw;
-    double vis_y1 = full_dy + full_dh;
-    if (vis_x1 > (double)window_w) vis_x1 = (double)window_w;
-    if (vis_y1 > (double)window_h) vis_y1 = (double)window_h;
-    if (vis_x1 < vis_x0) vis_x1 = vis_x0;
-    if (vis_y1 < vis_y0) vis_y1 = vis_y0;
-
-    /* Map visible screen rect → SVG user-unit rect. */
-    double pixels_per_unit_x = full_dw / svg->natural_w_f;
-    double pixels_per_unit_y = full_dh / svg->natural_h_f;
-    /* Aspect is locked when rendering, so the two should agree very closely;
-       pick the average for the scale used by the rasterizer. */
-    double pixels_per_unit = 0.5 * (pixels_per_unit_x + pixels_per_unit_y);
-    if (pixels_per_unit <= 0.0 || !isfinite(pixels_per_unit)) pixels_per_unit = 1.0;
-    if (pixels_per_unit_x <= 0.0) pixels_per_unit_x = pixels_per_unit;
-    if (pixels_per_unit_y <= 0.0) pixels_per_unit_y = pixels_per_unit;
-
-    double ix0 = (vis_x0 - full_dx) / pixels_per_unit_x;
-    double iy0 = (vis_y0 - full_dy) / pixels_per_unit_y;
-    double ix1 = (vis_x1 - full_dx) / pixels_per_unit_x;
-    double iy1 = (vis_y1 - full_dy) / pixels_per_unit_y;
-
-    /* Slight padding (1px in image units) so panning a little doesn't
-       expose unrasterized edges between debounced raster jobs. */
-    double pad = 1.0;
-    ix0 -= pad; iy0 -= pad;
-    ix1 += pad; iy1 += pad;
-    if (ix0 < 0.0) ix0 = 0.0;
-    if (iy0 < 0.0) iy0 = 0.0;
-    if (ix1 > svg->natural_w_f) ix1 = svg->natural_w_f;
-    if (iy1 > svg->natural_h_f) iy1 = svg->natural_h_f;
-
-    double iw = ix1 - ix0;
-    double ih = iy1 - iy0;
-    if (iw < 1.0) iw = 1.0;
-    if (ih < 1.0) ih = 1.0;
-
-    /* Target output pixels for this region. */
-    double out_w_d = iw * pixels_per_unit;
-    double out_h_d = ih * pixels_per_unit;
-
-    /* Apply the raster cap by reducing the effective scale, not by
-       clipping further. This makes the cap behave as "after this many
-       pixels, fall back to GPU bilinear scaling". */
-    double max_out = (double)SVG_MAX_RASTER_DIM;
-    double cap_scale = 1.0;
-    if (out_w_d > max_out) cap_scale = max_out / out_w_d;
-    if (out_h_d > max_out) {
-        double s2 = max_out / out_h_d;
-        if (s2 < cap_scale) cap_scale = s2;
-    }
-    double scale = pixels_per_unit * cap_scale;
-    int out_w = (int)floor(iw * scale + 0.5);
-    int out_h = (int)floor(ih * scale + 0.5);
-    if (out_w < 1) out_w = 1;
-    if (out_h < 1) out_h = 1;
-    if (out_w > SVG_MAX_RASTER_DIM) out_w = SVG_MAX_RASTER_DIM;
-    if (out_h > SVG_MAX_RASTER_DIM) out_h = SVG_MAX_RASTER_DIM;
-
-    SvgPlan plan;
-    plan.ix = (float)ix0;
-    plan.iy = (float)iy0;
-    plan.scale = (float)scale;
-    plan.out_w = out_w;
-    plan.out_h = out_h;
-    return plan;
-}
-
-/* Build a plan that renders the WHOLE SVG at the given per-tile output
-   pixel size. Used in tile mode so each tile shows the entire image
-   rasterized sharply at the current per-tile scale, then SDL just blits
-   that single texture N times across the grid. The cap behavior matches
-   svg_plan_for_view: above SVG_MAX_RASTER_DIM, fall back to GPU scaling. */
-static SvgPlan svg_plan_for_tile(const Viewer *viewer,
-                                 double per_tile_w, double per_tile_h) {
-    const SvgImage *svg = &viewer->src.v.svg;
-
-    /* Cap to the maximum raster dim; above that we GPU-upscale. */
-    double out_w_d = per_tile_w;
-    double out_h_d = per_tile_h;
-    double max_out = (double)SVG_MAX_RASTER_DIM;
-    if (out_w_d > max_out) out_w_d = max_out;
-    if (out_h_d > max_out) out_h_d = max_out;
-
-    /* Choose a scale such that out_w_d / scale == natural_w_f, i.e.
-       scale == out_w_d / natural_w_f, but compute it from whichever
-       dimension is more constrained so we stay within the cap on both. */
-    double sx = (svg->natural_w_f > 0.0) ? out_w_d / svg->natural_w_f : 1.0;
-    double sy = (svg->natural_h_f > 0.0) ? out_h_d / svg->natural_h_f : 1.0;
-    double scale = sx < sy ? sx : sy;
-    if (scale <= 0.0 || !isfinite(scale)) scale = 1.0;
-
-    int out_w = (int)floor(svg->natural_w_f * scale + 0.5);
-    int out_h = (int)floor(svg->natural_h_f * scale + 0.5);
-    if (out_w < 1) out_w = 1;
-    if (out_h < 1) out_h = 1;
-    if (out_w > SVG_MAX_RASTER_DIM) out_w = SVG_MAX_RASTER_DIM;
-    if (out_h > SVG_MAX_RASTER_DIM) out_h = SVG_MAX_RASTER_DIM;
-
-    SvgPlan plan;
-    plan.ix = 0.0f;
-    plan.iy = 0.0f;
-    plan.scale = (float)scale;
-    plan.out_w = out_w;
-    plan.out_h = out_h;
-    return plan;
-}
-
-/* Compute the per-tile on-screen size for SVG layout. Same math as the
-   non-SVG renderer uses for draw_w/draw_h: fit to window aspect, swap
-   axes for quarter rotation, multiply by zoom. */
-static void svg_compute_tile_size(const Viewer *viewer,
-                                  int window_w, int window_h,
-                                  double *out_w, double *out_h) {
-    int eff_w = viewer->src.width;
-    int eff_h = viewer->src.height;
-    bool quarter = (viewer->rotation_steps == 1 || viewer->rotation_steps == 3);
-    if (quarter) { int tmp = eff_w; eff_w = eff_h; eff_h = tmp; }
-    double img_aspect = (double)eff_w / (double)eff_h;
-    double win_aspect = (double)window_w / (double)window_h;
-    double fit_w, fit_h;
-    if (win_aspect > img_aspect) {
-        fit_h = (double)window_h;
-        fit_w = (double)window_h * img_aspect;
-    } else {
-        fit_w = (double)window_w;
-        fit_h = (double)window_w / img_aspect;
-    }
-    double zoom_v = viewer->zoom;
-    if (zoom_v <= 0.0 || !isfinite(zoom_v)) zoom_v = 1.0;
-    double tw = fit_w * zoom_v;
-    double th = fit_h * zoom_v;
-    if (tw < 1.0) tw = 1.0;
-    if (th < 1.0) th = 1.0;
-    *out_w = tw;
-    *out_h = th;
-}
-
-/* Pick the plan kind that best matches the current viewer state. */
-static SvgPlan svg_pick_plan(const Viewer *viewer,
-                             int window_w, int window_h) {
-    bool tiled = (viewer->tile_on && viewer->tile_radius > 0);
-    bool transformed = (viewer->rotation_steps != 0 ||
-                        viewer->flip_h || viewer->flip_v);
-    if (tiled || transformed) {
-        double tw, th;
-        svg_compute_tile_size(viewer, window_w, window_h, &tw, &th);
-        bool quarter = (viewer->rotation_steps == 1 || viewer->rotation_steps == 3);
-        double per_w = quarter ? th : tw;
-        double per_h = quarter ? tw : th;
-        return svg_plan_for_tile(viewer, per_w, per_h);
-    }
-    return svg_plan_for_view(viewer, window_w, window_h);
-}
-
-/* Decide whether the requested plan differs enough from what's currently
-   queued/showing to justify a new raster. Even a small zoom change can
-   produce a different out_w/h; require some change to avoid thrashing
-   when nothing meaningful happened (e.g., redraw on EXPOSED). */
-static bool svg_plan_meaningfully_different(const SvgPlan *a, const SvgPlan *b) {
-    if (a->out_w != b->out_w || a->out_h != b->out_h) return true;
-    /* compare floats with a small tolerance */
-    float ds = fabsf(a->scale - b->scale) / fmaxf(a->scale, 1e-6f);
-    float dix = fabsf(a->ix - b->ix);
-    float diy = fabsf(a->iy - b->iy);
-    if (ds > 0.001f) return true;
-    if (dix > 0.5f || diy > 0.5f) return true;
-    return false;
 }
 
 /* Build a transient PangoFontDescription from "Sans" + size + bold. The
@@ -2579,6 +2467,422 @@ static const BindEntry BINDS[] = {
 };
 static const int BINDS_COUNT = (int)(sizeof(BINDS) / sizeof(BINDS[0]));
 
+/* ---------- SVG tile-pyramid management (main-thread) ---------- */
+
+/* Returns true if the current view state differs from what was
+   recorded last frame. Also refreshes the recorded values. */
+static bool svg_view_changed(SvgImage *svg, int window_w, int window_h,
+                             const Viewer *viewer) {
+    if (!svg->last_view_valid
+        || svg->last_window_w     != window_w
+        || svg->last_window_h     != window_h
+        || svg->last_zoom         != viewer->zoom
+        || svg->last_anchor_x     != viewer->anchor_x
+        || svg->last_anchor_y     != viewer->anchor_y
+        || svg->last_pan_off_x    != viewer->pan_off_x
+        || svg->last_pan_off_y    != viewer->pan_off_y
+        || svg->last_rotation_steps != viewer->rotation_steps
+        || svg->last_flip_h       != viewer->flip_h
+        || svg->last_flip_v       != viewer->flip_v
+        || svg->last_tile_on      != viewer->tile_on
+        || svg->last_tile_radius  != viewer->tile_radius) {
+        svg->last_view_valid       = true;
+        svg->last_window_w         = window_w;
+        svg->last_window_h         = window_h;
+        svg->last_zoom             = viewer->zoom;
+        svg->last_anchor_x         = viewer->anchor_x;
+        svg->last_anchor_y         = viewer->anchor_y;
+        svg->last_pan_off_x        = viewer->pan_off_x;
+        svg->last_pan_off_y        = viewer->pan_off_y;
+        svg->last_rotation_steps   = viewer->rotation_steps;
+        svg->last_flip_h           = viewer->flip_h;
+        svg->last_flip_v           = viewer->flip_v;
+        svg->last_tile_on          = viewer->tile_on;
+        svg->last_tile_radius      = viewer->tile_radius;
+        return true;
+    }
+    return false;
+}
+
+/* Maintain the SVG sharp-tile pyramid for this frame:
+   - Detect view-state changes and bump generation accordingly.
+   - Decide whether a sharp tile is wanted (only when zoomed in past
+     base sharpness AND not in whole-image transform mode).
+   - Queue a worker request after the debounce window if so.
+   - Claim any finished worker buffer that matches the current
+     generation, uploading it into svg->tile_tex.
+   Called near the top of render(), before the texture draw block. */
+static void svg_update_pyramid(Viewer *viewer, int window_w, int window_h,
+                               double draw_w, double draw_h) {
+    if (viewer->src.kind != IMG_SVG) return;
+    SvgImage *svg = &viewer->src.v.svg;
+
+    if (svg_view_changed(svg, window_w, window_h, viewer)) {
+        svg_bump_generation(svg);
+    }
+
+    /* Tile-mode (the (2R+1)x(2R+1) grid) draws each grid cell as a
+       full image; producing an overlay tile per grid cell would be
+       expensive and rarely useful. Stay on the base in tile mode. */
+    bool tiled = (viewer->tile_on && viewer->tile_radius > 0);
+    if (tiled) {
+        svg->tile_valid = false;
+        return;
+    }
+
+    int eff_w = viewer->src.width;
+    int eff_h = viewer->src.height;
+    if (eff_w < 1 || eff_h < 1 || draw_w < 1.0 || draw_h < 1.0) return;
+
+    /* For rotated/flipped views we conservatively raster the whole
+       image rather than computing a rotated-visibility intersection
+       (which is fiddly and the SVG_TILE_MAX_DIM cap keeps it bounded
+       anyway). draw_w/draw_h still correctly describe the on-screen
+       footprint, so PPU is right; only the visible-rect calc below is
+       affected. */
+    bool transformed = (viewer->rotation_steps != 0
+                        || viewer->flip_h || viewer->flip_v);
+
+    /* PPU = on-screen pixels per SVG user unit. The base raster's PPU
+       (relative to the natural SVG) is base_w / natural_w. If the
+       on-screen image's PPU exceeds the base's by more than ~5 %, we
+       want a sharper tile. Below that, GPU bilinear on the base is
+       fine and a tile would just waste cycles. */
+    double ppu_x = draw_w / svg->natural_w_f;
+    double ppu_y = draw_h / svg->natural_h_f;
+    double ppu   = (ppu_x < ppu_y) ? ppu_x : ppu_y;
+    double base_ppu = (double)svg->width / svg->natural_w_f;
+    if (ppu <= base_ppu * 1.05) {
+        /* Base is sharp enough — no tile needed. */
+        svg->tile_valid = false;
+        /* Mark as if we'd already requested for current gen, so the
+           gate below won't fire for this view. The generation will
+           bump on the next view change anyway. */
+        svg->has_last_requested = true;
+        svg->last_requested_generation = svg->current_generation;
+        return;
+    }
+
+    /* Compute the visible image rect on screen, then convert to SVG
+       user-unit coordinates. For rotated/flipped views we just raster
+       the whole image (see comment above). */
+    double ix0, iy0, ix1, iy1;
+    if (transformed) {
+        ix0 = 0.0; iy0 = 0.0;
+        ix1 = svg->natural_w_f;
+        iy1 = svg->natural_h_f;
+    } else {
+        /* On-screen position of the full image rect (matches render's math). */
+        double w2p_sx, w2p_sy;
+        window_to_pixel_scale(viewer, &w2p_sx, &w2p_sy);
+        double pan_px_x = viewer->pan_off_x * w2p_sx;
+        double pan_px_y = viewer->pan_off_y * w2p_sy;
+        double img_x = (double)window_w * 0.5 - viewer->anchor_x * draw_w + pan_px_x;
+        double img_y = (double)window_h * 0.5 - viewer->anchor_y * draw_h + pan_px_y;
+
+        double vis_x0 = img_x > 0.0 ? 0.0 : -img_x;
+        double vis_y0 = img_y > 0.0 ? 0.0 : -img_y;
+        double vis_x1 = ((double)window_w - img_x);
+        double vis_y1 = ((double)window_h - img_y);
+        if (vis_x1 > draw_w) vis_x1 = draw_w;
+        if (vis_y1 > draw_h) vis_y1 = draw_h;
+        if (vis_x1 <= vis_x0 || vis_y1 <= vis_y0) {
+            /* Image is fully off-screen — don't bother. Same trick as
+               the "base is sharp enough" branch: pretend we've already
+               requested for this gen so we don't spin trying. */
+            svg->has_last_requested = true;
+            svg->last_requested_generation = svg->current_generation;
+            return;
+        }
+
+        /* Map screen-px to SVG user units. */
+        double img_to_svg_x = svg->natural_w_f / draw_w;
+        double img_to_svg_y = svg->natural_h_f / draw_h;
+        ix0 = vis_x0 * img_to_svg_x;
+        iy0 = vis_y0 * img_to_svg_y;
+        ix1 = vis_x1 * img_to_svg_x;
+        iy1 = vis_y1 * img_to_svg_y;
+    }
+
+    /* Pad by SVG_TILE_PAD_RATIO so small pans don't immediately invalidate
+       the tile. Clamp to the SVG's natural bounds. */
+    double iw = ix1 - ix0;
+    double ih = iy1 - iy0;
+    double pad_x = iw * SVG_TILE_PAD_RATIO;
+    double pad_y = ih * SVG_TILE_PAD_RATIO;
+    ix0 -= pad_x; iy0 -= pad_y;
+    ix1 += pad_x; iy1 += pad_y;
+    if (ix0 < 0.0) ix0 = 0.0;
+    if (iy0 < 0.0) iy0 = 0.0;
+    if (ix1 > svg->natural_w_f) ix1 = svg->natural_w_f;
+    if (iy1 > svg->natural_h_f) iy1 = svg->natural_h_f;
+    iw = ix1 - ix0;
+    ih = iy1 - iy0;
+    if (iw <= 0.0 || ih <= 0.0) return;
+
+    /* Output size: covers the (padded) visible region at current PPU,
+       capped at SVG_TILE_MAX_DIM AND at a render scale where the
+       document-times-scale fits within cairo's max image surface size
+       (~32767 px on the image backend). librsvg internally allocates
+       group/filter surfaces sized to viewport*scale, and exceeding the
+       cap silently produces a CAIRO_STATUS_INVALID_SIZE.
+
+       The cap depends on the natural SVG dimensions: for a long
+       document the safe scale is small. Past the cap, the GPU
+       bilinearly upscales the tile, which is imperceptibly different
+       from a true vector raster at high zoom. */
+    double doc_long = svg->natural_w_f > svg->natural_h_f
+                    ? svg->natural_w_f : svg->natural_h_f;
+    double safe_scale_cap = doc_long > 0.0 ? (28000.0 / doc_long) : 8.0;
+    if (safe_scale_cap < 1.0) safe_scale_cap = 1.0; /* always at least 1× */
+    double render_scale = ppu; /* SVG-units to output-pixels */
+    if (render_scale > safe_scale_cap) {
+        render_scale = safe_scale_cap;
+    }
+    double want_out_w = iw * render_scale;
+    double want_out_h = ih * render_scale;
+    double cap_scale = 1.0;
+    if (want_out_w > (double)SVG_TILE_MAX_DIM) {
+        cap_scale = (double)SVG_TILE_MAX_DIM / want_out_w;
+    }
+    if (want_out_h > (double)SVG_TILE_MAX_DIM) {
+        double s = (double)SVG_TILE_MAX_DIM / want_out_h;
+        if (s < cap_scale) cap_scale = s;
+    }
+    int out_w = (int)floor(want_out_w * cap_scale + 0.5);
+    int out_h = (int)floor(want_out_h * cap_scale + 0.5);
+    if (out_w < 1) out_w = 1;
+    if (out_h < 1) out_h = 1;
+    if (out_w > SVG_TILE_MAX_DIM) out_w = SVG_TILE_MAX_DIM;
+    if (out_h > SVG_TILE_MAX_DIM) out_h = SVG_TILE_MAX_DIM;
+
+    /* Decide whether to queue a worker request. The single rule is:
+
+         request iff
+             - the tile we have isn't valid for the CURRENT generation
+               (so the user can't already see a sharp tile), AND
+             - we haven't already queued a request for the CURRENT
+               generation (so we don't spam the worker), AND
+             - the debounce window has elapsed since the last view
+               change (so fast-scrolling doesn't queue dozens of
+               jobs).
+
+       Tracking only `last_requested_generation` (instead of a
+       separate dirty flag) means there's exactly one source of
+       truth for "is a sharp tile in the pipeline for this view".
+       If a stale tile is discarded by the consume block below, the
+       generation comparison ensures we'll re-request automatically
+       — no manual dirty-flag management required. */
+    Uint64 now = SDL_GetTicksNS();
+    bool tile_already_for_current_gen =
+        svg->tile_valid
+        && svg->tile_generation == svg->current_generation;
+    bool request_already_for_current_gen =
+        svg->has_last_requested
+        && svg->last_requested_generation == svg->current_generation;
+    if (!tile_already_for_current_gen
+        && !request_already_for_current_gen
+        && now - svg->dirty_since_ns >= SVG_DEBOUNCE_NS) {
+        svg_request_tile(svg, svg->current_generation,
+                         ix0, iy0, iw, ih, out_w, out_h);
+    }
+
+    /* Try to consume any finished tile. We hold svg->mu for the entire
+       claim+upload sequence so the worker can't start writing into
+       delivered_rgba (via the post-render swap) while we're still
+       reading from it. The lock is released BEFORE creating SDL
+       textures (which are renderer-thread state, not tile state) and
+       reacquired only briefly to drop job_done. */
+    SDL_LockMutex(svg->mu);
+    bool have_done = svg->job_done;
+    bool gen_ok    = have_done && svg->done_generation == svg->current_generation;
+    bool nonempty  = have_done && svg->done_out_w > 0 && svg->done_out_h > 0;
+    int    cw  = svg->done_out_w;
+    int    ch  = svg->done_out_h;
+    double cix = svg->done_ix;
+    double ciy = svg->done_iy;
+    double ciw = svg->done_iw;
+    double cih = svg->done_ih;
+    if (!have_done) {
+        SDL_UnlockMutex(svg->mu);
+    } else if (!(gen_ok && nonempty)) {
+        /* Stale or failed render — drain the slot and move on. The
+           buffer (if any) stays in delivered_rgba; the worker will
+           overwrite it on the next render via the swap. */
+        svg->job_done = false;
+        SDL_UnlockMutex(svg->mu);
+    } else {
+        /* Fresh tile for the current view. The lock stays held until
+           after SDL_UpdateTexture finishes — so the worker, even if
+           it's just finished another job, can't overwrite the buffer
+           we're reading. */
+        unsigned char *cbuf = svg->delivered_rgba;
+
+        bool create = (!svg->tile_tex
+                       || svg->tile_tex_w != cw
+                       || svg->tile_tex_h != ch);
+        if (create) {
+            if (svg->tile_tex) SDL_DestroyTexture(svg->tile_tex);
+            /* Cairo's CAIRO_FORMAT_ARGB32 stores bytes B,G,R,A in
+               memory on little-endian (the "32" refers to a 32-bit
+               value 0xAARRGGBB, which is BGRA in memory on LE).
+               SDL_PIXELFORMAT_ARGB8888 has matching memory layout
+               (the "8888" naming describes the packed value in MSB
+               order, which on LE means BGRA in memory). With this
+               format SDL can sample cairo's buffer with no byte
+               swapping, and SDL_BLENDMODE_BLEND_PREMULTIPLIED handles
+               the premultiplied alpha correctly. Saves a full pass
+               over the tile pixels every time a new tile lands. */
+            svg->tile_tex = SDL_CreateTexture(viewer->renderer,
+                                              SDL_PIXELFORMAT_ARGB8888,
+                                              SDL_TEXTUREACCESS_STATIC,
+                                              cw, ch);
+            if (!svg->tile_tex) {
+                /* GPU rejected the size (over max texture, OOM, etc.).
+                   Stay on the base. We don't clear has_last_requested
+                   here — re-requesting the same plan would just fail
+                   the same way. The next view change will bump the
+                   generation, which triggers a new plan with possibly
+                   a smaller size. */
+                svg->tile_valid = false;
+                svg->tile_tex_w = 0;
+                svg->tile_tex_h = 0;
+                svg->job_done = false;
+                SDL_UnlockMutex(svg->mu);
+                return;
+            }
+            SDL_SetTextureScaleMode(svg->tile_tex,
+                                    viewer->nearest ? SDL_SCALEMODE_NEAREST
+                                                    : SDL_SCALEMODE_LINEAR);
+            SDL_SetTextureBlendMode(svg->tile_tex,
+                                    SDL_BLENDMODE_BLEND_PREMULTIPLIED);
+            svg->tile_tex_w = cw;
+            svg->tile_tex_h = ch;
+        }
+        bool ok = SDL_UpdateTexture(svg->tile_tex, NULL, cbuf, cw * 4);
+        svg->job_done = false;
+        SDL_UnlockMutex(svg->mu);
+
+        if (!ok) {
+            /* Upload failed — invalidate so we don't draw stale, and
+               clear last_requested for the current gen so the request
+               gate will fire again on the next render. */
+            svg->tile_valid = false;
+            svg->has_last_requested = false;
+            return;
+        }
+        svg->tile_ix = cix; svg->tile_iy = ciy;
+        svg->tile_iw = ciw; svg->tile_ih = cih;
+        svg->tile_generation = svg->current_generation;
+        svg->tile_valid = true;
+    }
+}
+
+/* Draw the sharp tile overlay on top of the base, sharing the parent's
+   transform pipeline (flip → rotate about parent center). The tile
+   texture itself was rasterized in un-rotated, un-flipped image space;
+   we map it through the same transform as the parent so the overlay
+   lands exactly where the corresponding base pixels are.
+
+   parent_pre_dst is the parent's *pre-rotation* dst rect (its width
+   and height are swapped relative to the on-screen footprint when
+   `quarter` rotation is in effect — same convention as the base draw).
+   parent_cx/cy is the parent's screen-space center (post-flip,
+   post-rotation centroid; rotation is about this point).
+
+   No-op if the tile is invalid or doesn't match the current view's
+   generation. */
+static void svg_draw_tile_overlay(const Viewer *viewer,
+                                  double parent_cx, double parent_cy,
+                                  double parent_pre_w, double parent_pre_h,
+                                  double angle_deg,
+                                  SDL_FlipMode flip,
+                                  bool quarter) {
+    if (viewer->src.kind != IMG_SVG) return;
+    const SvgImage *svg = &viewer->src.v.svg;
+    if (!svg->tile_valid || !svg->tile_tex) return;
+    if (svg->tile_generation != svg->current_generation) return;
+    if (svg->natural_w_f <= 0.0 || svg->natural_h_f <= 0.0) return;
+
+    /* The "image-frame" dst is the rect that, when SDL rotates it about
+       its center, becomes the on-screen footprint of the un-rotated
+       image. For quarter rotations the parent code swaps w/h so that
+       post-rotation orientation is correct — we work in that same
+       frame.
+
+       Image dimensions in the frame (= natural image aspect, scaled
+       to parent_pre size). When quarter, the texture's natural width
+       maps to parent_pre_h on screen (because rotation will swap them
+       back). To keep the tile's texture-space-to-image-space mapping
+       linear, we always reason in "image space" where x runs along
+       natural_w and y runs along natural_h — the parent_pre rect
+       already represents that frame. */
+    double frame_w = parent_pre_w;
+    double frame_h = parent_pre_h;
+    if (quarter) {
+        /* In the parent_pre rect for quarter rotations, w corresponds
+           to the image's HEIGHT and h to its WIDTH (because rotation
+           swaps them). Flip so frame_w/frame_h match natural axes. */
+        frame_w = parent_pre_h;
+        frame_h = parent_pre_w;
+    }
+
+    /* Tile rect in image space, normalized to [0..1]. */
+    double rel_x0 = svg->tile_ix / svg->natural_w_f;
+    double rel_y0 = svg->tile_iy / svg->natural_h_f;
+    double rel_w  = svg->tile_iw / svg->natural_w_f;
+    double rel_h  = svg->tile_ih / svg->natural_h_f;
+
+    /* Tile rect in the un-rotated, un-flipped frame (axis-aligned with
+       the natural image, centered at parent center). */
+    double tile_off_x = (rel_x0 + rel_w * 0.5 - 0.5) * frame_w;
+    double tile_off_y = (rel_y0 + rel_h * 0.5 - 0.5) * frame_h;
+    double tile_w_img = rel_w * frame_w;
+    double tile_h_img = rel_h * frame_h;
+
+    /* Apply flip in image space about the parent center. SDL will also
+       flip the tile texture itself when we pass `flip`, which mirrors
+       the *content* — we just need to mirror the *position*. */
+    if (flip & SDL_FLIP_HORIZONTAL) tile_off_x = -tile_off_x;
+    if (flip & SDL_FLIP_VERTICAL)   tile_off_y = -tile_off_y;
+
+    /* Build the pre-rotation dst rect for the tile. In the parent's
+       pre-rotation frame, the rect lives at (parent_cx + tile_off_x,
+       parent_cy + tile_off_y) with size matching its image rect.
+
+       For quarter rotations, the parent dst's w corresponds to
+       image-height on screen, so we similarly swap the tile dst's
+       w/h here. */
+    double tile_pre_w = quarter ? tile_h_img : tile_w_img;
+    double tile_pre_h = quarter ? tile_w_img : tile_h_img;
+
+    /* For quarter rotations, the offset-along-image-axes also needs
+       swapping to match the pre-rotation frame. (Pre-rotation x-axis
+       runs along image-y, etc.) */
+    double pre_off_x = quarter ? tile_off_y : tile_off_x;
+    double pre_off_y = quarter ? tile_off_x : tile_off_y;
+
+    SDL_FRect dst;
+    dst.w = (float)tile_pre_w;
+    dst.h = (float)tile_pre_h;
+    dst.x = (float)(parent_cx + pre_off_x - tile_pre_w * 0.5);
+    dst.y = (float)(parent_cy + pre_off_y - tile_pre_h * 0.5);
+    if (dst.w < 0.5f || dst.h < 0.5f) return;
+
+    /* Pivot rotation about the parent's center, not the tile's. */
+    SDL_FPoint pivot = {
+        (float)(parent_cx - dst.x),
+        (float)(parent_cy - dst.y)
+    };
+
+    if (angle_deg != 0.0 || flip != SDL_FLIP_NONE) {
+        SDL_RenderTextureRotated(viewer->renderer, svg->tile_tex,
+                                 NULL, &dst, angle_deg, &pivot, flip);
+    } else {
+        SDL_RenderTexture(viewer->renderer, svg->tile_tex, NULL, &dst);
+    }
+}
+
 static void render(Viewer *viewer) {
     int window_w = 1, window_h = 1;
     SDL_GetCurrentRenderOutputSize(viewer->renderer, &window_w, &window_h);
@@ -2589,92 +2893,73 @@ static void render(Viewer *viewer) {
     SDL_SetRenderDrawColor(viewer->renderer, br, bg, bb, 255);
     SDL_RenderClear(viewer->renderer);
 
-    if (viewer->src.kind == IMG_SVG) {
-        SvgImage *svg = &viewer->src.v.svg;
+    /* Classic full-image bilinear scale, with optional flip / rotation
+       / tile. Rotation by 90 or 270 degrees swaps the on-screen aspect;
+       we honor that so the rotated image fits the same way the natural
+       image would. All image kinds (static raster, animated, pre-
+       rasterized SVG) go through this path — they share the same
+       viewer->texture. */
+    if (viewer->texture) {
+        int eff_w = viewer->src.width;
+        int eff_h = viewer->src.height;
+        bool quarter = (viewer->rotation_steps == 1 || viewer->rotation_steps == 3);
+        if (quarter) { int tmp = eff_w; eff_w = eff_h; eff_h = tmp; }
 
-        /* Common flip/rotation state. Rotation swaps the on-screen
-           footprint for 90/270 degrees. Same conventions as the non-SVG
-           path so behavior is consistent. */
+        /* Compute fit/draw size against the rotated aspect. */
+        double img_aspect = (double)eff_w / (double)eff_h;
+        double win_aspect = (double)window_w / (double)window_h;
+        double fit_w, fit_h;
+        if (win_aspect > img_aspect) {
+            fit_h = (double)window_h;
+            fit_w = (double)window_h * img_aspect;
+        } else {
+            fit_w = (double)window_w;
+            fit_h = (double)window_w / img_aspect;
+        }
+        double zoom = viewer->zoom;
+        if (zoom <= 0.0 || !isfinite(zoom)) zoom = 1.0;
+        double draw_w = fit_w * zoom;
+        double draw_h = fit_h * zoom;
+        if (draw_w < 1.0) draw_w = 1.0;
+        if (draw_h < 1.0) draw_h = 1.0;
+
+        /* SVG: maintain the sharp-tile pyramid. May queue a worker
+           request and/or upload a freshly-rendered tile. The base
+           texture (viewer->texture) is drawn regardless; the tile
+           is overlaid afterwards when valid. */
+        svg_update_pyramid(viewer, window_w, window_h, draw_w, draw_h);
+
+        double center_x = (double)window_w * 0.5;
+        double center_y = (double)window_h * 0.5;
+
+        /* Drag pans in window-unit screen coordinates. Convert to
+           renderer-pixel units and apply as a final translation. */
+        double w2p_sx, w2p_sy;
+        window_to_pixel_scale(viewer, &w2p_sx, &w2p_sy);
+        double pan_px_x = viewer->pan_off_x * w2p_sx;
+        double pan_px_y = viewer->pan_off_y * w2p_sy;
+
         SDL_FlipMode base_flip =
             (viewer->flip_h && viewer->flip_v) ? SDL_FLIP_HORIZONTAL_AND_VERTICAL :
             viewer->flip_h ? SDL_FLIP_HORIZONTAL :
             viewer->flip_v ? SDL_FLIP_VERTICAL :
             SDL_FLIP_NONE;
         double angle = (double)viewer->rotation_steps * 90.0;
-        bool quarter = (viewer->rotation_steps == 1 || viewer->rotation_steps == 3);
 
-        /* Drag pans in window-unit screen coordinates. Convert to pixel
-           units for compositing. */
-        double w2p_sx, w2p_sy;
-        window_to_pixel_scale(viewer, &w2p_sx, &w2p_sy);
-        double pan_px_x = viewer->pan_off_x * w2p_sx;
-        double pan_px_y = viewer->pan_off_y * w2p_sy;
-
-        /* Pick up any completed worker raster. */
-        SvgPlan adopted;
-        if (svg_try_consume(svg, &adopted)) {
-            if (adopted.out_w > 0 && adopted.out_h > 0) {
-                if (ensure_texture(viewer, adopted.out_w, adopted.out_h)) {
-                    SDL_UpdateTexture(viewer->texture, NULL,
-                                      svg->shown, adopted.out_w * 4);
-                }
-            }
-        }
-
-        /* In tile mode we want each tile to be the whole SVG, rasterized
-           sharp at per-tile pixel size. In single-image mode we normally
-           keep the "render only the visible portion" optimization — but
-           when the image is rotated or flipped, sub-region geometry on a
-           rotated quad gets fiddly, so we switch to whole-image raster
-           there too. Slightly more raster work, much simpler math. */
-        bool tiled = (viewer->tile_on && viewer->tile_radius > 0);
-        bool transformed = (viewer->rotation_steps != 0 ||
-                            viewer->flip_h || viewer->flip_v);
-        bool whole_image_mode = tiled || transformed;
-
-        /* Per-tile on-screen size, derived identically to the non-SVG
-           draw_w/draw_h math. */
-        double tile_w, tile_h;
-        svg_compute_tile_size(viewer, window_w, window_h, &tile_w, &tile_h);
-
-        /* Build the desired plan and decide whether to request a re-raster. */
-        SvgPlan want = svg_pick_plan(viewer, window_w, window_h);
-
-        /* If we don't have any raster yet, force a synchronous request and
-           wait briefly so the first frame isn't blank. */
-        if (!viewer->texture) {
-            svg_request(svg, &want);
-            for (int spin = 0; spin < 100; spin++) {
-                SDL_Delay(2);
-                if (svg_try_consume(svg, &adopted)) {
-                    if (adopted.out_w > 0 && adopted.out_h > 0 &&
-                        ensure_texture(viewer, adopted.out_w, adopted.out_h)) {
-                        SDL_UpdateTexture(viewer->texture, NULL,
-                                          svg->shown, adopted.out_w * 4);
-                    }
-                    break;
-                }
-            }
-        } else if (svg_plan_meaningfully_different(&want, &svg->last_requested_plan)) {
-            svg->dirty = true;
-            svg->dirty_since_ns = SDL_GetTicksNS();
-        }
-
-        /* Helper: produce the dst rect for one tile at grid (gx, gy)
-           centered on window center, with anchor + pan applied.
-           Identical layout math to the non-SVG path. */
-        double center_x = (double)window_w * 0.5;
-        double center_y = (double)window_h * 0.5;
-
-        int radius = tiled ? viewer->tile_radius : 0;
+        /* Tile mode produces a (2R+1) x (2R+1) grid of tiles around
+           the center, where R = tile_radius. Each tile is the same
+           size as a single draw_w x draw_h, contiguous. With mirror
+           mode on, alternating tiles are flipped to make seams match. */
+        int radius = (viewer->tile_on && viewer->tile_radius > 0) ? viewer->tile_radius : 0;
 
         for (int gy = -radius; gy <= radius; gy++) {
             for (int gx = -radius; gx <= radius; gx++) {
-                /* Per-tile flip if mirrored tiling is on. */
+                /* Compute per-tile flip when in mirror mode. */
                 SDL_FlipMode flip = base_flip;
-                if (tiled && viewer->tile_mirror) {
+                if (viewer->tile_on && viewer->tile_mirror) {
                     bool fh = (gx & 1) != 0;
                     bool fv = (gy & 1) != 0;
+                    /* XOR the base flips with the per-tile flips. */
                     bool h = ((flip & SDL_FLIP_HORIZONTAL) != 0) ^ fh;
                     bool v = ((flip & SDL_FLIP_VERTICAL)   != 0) ^ fv;
                     flip = (h && v) ? SDL_FLIP_HORIZONTAL_AND_VERTICAL :
@@ -2682,201 +2967,62 @@ static void render(Viewer *viewer) {
                            v ? SDL_FLIP_VERTICAL :
                            SDL_FLIP_NONE;
                 }
+                /* Position: anchor places (anchor_x, anchor_y) of the
+                   CENTER tile at the window center, then drag pan
+                   offset translates the entire composition in
+                   screen space. Other tiles are offset by integer
+                   multiples of draw_w / draw_h (the post-rotation
+                   footprint). */
+                double tile_cx = center_x - viewer->anchor_x * draw_w + draw_w * 0.5
+                               + (double)gx * draw_w + pan_px_x;
+                double tile_cy = center_y - viewer->anchor_y * draw_h + draw_h * 0.5
+                               + (double)gy * draw_h + pan_px_y;
 
-                double tile_cx = center_x - viewer->anchor_x * tile_w + tile_w * 0.5
-                               + (double)gx * tile_w + pan_px_x;
-                double tile_cy = center_y - viewer->anchor_y * tile_h + tile_h * 0.5
-                               + (double)gy * tile_h + pan_px_y;
-
-                /* (1) Backdrop. For SDL_RenderTextureRotated, the dst rect
-                   must use the pre-rotation footprint shape; quarter
-                   rotations swap dims. */
-                if (svg->backdrop_tex) {
-                    SDL_FRect bdst;
-                    if (quarter) {
-                        bdst.w = (float)tile_h;
-                        bdst.h = (float)tile_w;
-                    } else {
-                        bdst.w = (float)tile_w;
-                        bdst.h = (float)tile_h;
-                    }
-                    bdst.x = (float)(tile_cx - (double)bdst.w * 0.5);
-                    bdst.y = (float)(tile_cy - (double)bdst.h * 0.5);
-                    if (angle != 0.0 || flip != SDL_FLIP_NONE) {
-                        SDL_RenderTextureRotated(viewer->renderer,
-                                                 svg->backdrop_tex,
-                                                 NULL, &bdst,
-                                                 angle, NULL, flip);
-                    } else {
-                        SDL_RenderTexture(viewer->renderer,
-                                          svg->backdrop_tex, NULL, &bdst);
-                    }
+                /* SDL_RenderTextureRotated stretches the texture to
+                   fill dst, THEN rotates around the rect center.
+                   For a 90/270 rotation, the on-screen footprint
+                   gets swapped by the rotation — so we must build
+                   the pre-rotation dst with swapped dimensions so
+                   that the texture's natural aspect is preserved
+                   and the post-rotation footprint matches draw_w x
+                   draw_h. */
+                SDL_FRect dst;
+                if (quarter) {
+                    dst.w = (float)draw_h;
+                    dst.h = (float)draw_w;
+                } else {
+                    dst.w = (float)draw_w;
+                    dst.h = (float)draw_h;
                 }
+                /* Center the rect on (tile_cx, tile_cy) regardless of
+                   which dimensions we chose; rotation is around the
+                   rect center, so the centroid stays put. */
+                dst.x = (float)(tile_cx - (double)dst.w * 0.5);
+                dst.y = (float)(tile_cy - (double)dst.h * 0.5);
 
-                /* (2) Sharp clipped raster. When we're in whole-image
-                   mode (tile or rotated/flipped), the shown buffer
-                   represents the WHOLE SVG and we draw it filling each
-                   tile's footprint. Otherwise it represents a sub-region
-                   and we map it inside the tile rect. */
-                if (viewer->texture && svg->shown_plan.scale > 0.0f) {
-                    if (whole_image_mode) {
-                        SDL_FRect dst;
-                        if (quarter) {
-                            dst.w = (float)tile_h;
-                            dst.h = (float)tile_w;
-                        } else {
-                            dst.w = (float)tile_w;
-                            dst.h = (float)tile_h;
-                        }
-                        dst.x = (float)(tile_cx - (double)dst.w * 0.5);
-                        dst.y = (float)(tile_cy - (double)dst.h * 0.5);
-                        if (angle != 0.0 || flip != SDL_FLIP_NONE) {
-                            SDL_RenderTextureRotated(viewer->renderer,
-                                                     viewer->texture,
-                                                     NULL, &dst,
-                                                     angle, NULL, flip);
-                        } else {
-                            SDL_RenderTexture(viewer->renderer,
-                                              viewer->texture, NULL, &dst);
-                        }
-                    } else {
-                        /* Untransformed single-image SVG: shown buffer is
-                           a sub-region in image space. Map it inside the
-                           (unrotated) tile rect. No rotation/flip in this
-                           branch — those route through whole-image mode. */
-                        double ppu_x = tile_w / svg->natural_w_f;
-                        double ppu_y = tile_h / svg->natural_h_f;
-                        double sw = (double)svg->shown_plan.out_w /
-                                    (double)svg->shown_plan.scale;
-                        double sh = (double)svg->shown_plan.out_h /
-                                    (double)svg->shown_plan.scale;
-                        double sx0 = (double)svg->shown_plan.ix;
-                        double sy0 = (double)svg->shown_plan.iy;
-
-                        SDL_FRect dst;
-                        dst.x = (float)(tile_cx - tile_w * 0.5 + sx0 * ppu_x);
-                        dst.y = (float)(tile_cy - tile_h * 0.5 + sy0 * ppu_y);
-                        dst.w = (float)(sw * ppu_x);
-                        dst.h = (float)(sh * ppu_y);
-                        SDL_RenderTexture(viewer->renderer,
-                                          viewer->texture, NULL, &dst);
-                    }
+                if (angle != 0.0 || flip != SDL_FLIP_NONE) {
+                    SDL_RenderTextureRotated(viewer->renderer,
+                                             viewer->texture,
+                                             NULL, &dst,
+                                             angle, NULL, flip);
+                } else {
+                    SDL_RenderTexture(viewer->renderer,
+                                      viewer->texture, NULL, &dst);
                 }
-            }
-        }
-    } else {
-        /* Non-SVG path: classic full-image bilinear scale, with optional
-           flip / rotation / tile. Rotation by 90 or 270 degrees swaps
-           the on-screen aspect; we honor that so the rotated image fits
-           the same way the natural image would. */
-        if (viewer->texture) {
-            int eff_w = viewer->src.width;
-            int eff_h = viewer->src.height;
-            bool quarter = (viewer->rotation_steps == 1 || viewer->rotation_steps == 3);
-            if (quarter) { int tmp = eff_w; eff_w = eff_h; eff_h = tmp; }
-
-            /* Compute fit/draw size against the rotated aspect. */
-            double img_aspect = (double)eff_w / (double)eff_h;
-            double win_aspect = (double)window_w / (double)window_h;
-            double fit_w, fit_h;
-            if (win_aspect > img_aspect) {
-                fit_h = (double)window_h;
-                fit_w = (double)window_h * img_aspect;
-            } else {
-                fit_w = (double)window_w;
-                fit_h = (double)window_w / img_aspect;
-            }
-            double zoom = viewer->zoom;
-            if (zoom <= 0.0 || !isfinite(zoom)) zoom = 1.0;
-            double draw_w = fit_w * zoom;
-            double draw_h = fit_h * zoom;
-            if (draw_w < 1.0) draw_w = 1.0;
-            if (draw_h < 1.0) draw_h = 1.0;
-
-            double center_x = (double)window_w * 0.5;
-            double center_y = (double)window_h * 0.5;
-
-            /* Drag pans in window-unit screen coordinates. Convert to
-               renderer-pixel units and apply as a final translation. */
-            double w2p_sx, w2p_sy;
-            window_to_pixel_scale(viewer, &w2p_sx, &w2p_sy);
-            double pan_px_x = viewer->pan_off_x * w2p_sx;
-            double pan_px_y = viewer->pan_off_y * w2p_sy;
-
-            SDL_FlipMode base_flip =
-                (viewer->flip_h && viewer->flip_v) ? SDL_FLIP_HORIZONTAL_AND_VERTICAL :
-                viewer->flip_h ? SDL_FLIP_HORIZONTAL :
-                viewer->flip_v ? SDL_FLIP_VERTICAL :
-                SDL_FLIP_NONE;
-            double angle = (double)viewer->rotation_steps * 90.0;
-
-            /* Tile mode produces a (2R+1) x (2R+1) grid of tiles around
-               the center, where R = tile_radius. Each tile is the same
-               size as a single draw_w x draw_h, contiguous. With mirror
-               mode on, alternating tiles are flipped to make seams match. */
-            int radius = (viewer->tile_on && viewer->tile_radius > 0) ? viewer->tile_radius : 0;
-
-            for (int gy = -radius; gy <= radius; gy++) {
-                for (int gx = -radius; gx <= radius; gx++) {
-                    /* Compute per-tile flip when in mirror mode. */
-                    SDL_FlipMode flip = base_flip;
-                    if (viewer->tile_on && viewer->tile_mirror) {
-                        bool fh = (gx & 1) != 0;
-                        bool fv = (gy & 1) != 0;
-                        /* XOR the base flips with the per-tile flips. */
-                        bool h = ((flip & SDL_FLIP_HORIZONTAL) != 0) ^ fh;
-                        bool v = ((flip & SDL_FLIP_VERTICAL)   != 0) ^ fv;
-                        flip = (h && v) ? SDL_FLIP_HORIZONTAL_AND_VERTICAL :
-                               h ? SDL_FLIP_HORIZONTAL :
-                               v ? SDL_FLIP_VERTICAL :
-                               SDL_FLIP_NONE;
-                    }
-                    /* Position: anchor places (anchor_x, anchor_y) of the
-                       CENTER tile at the window center, then drag pan
-                       offset translates the entire composition in
-                       screen space. Other tiles are offset by integer
-                       multiples of draw_w / draw_h (the post-rotation
-                       footprint). */
-                    double tile_cx = center_x - viewer->anchor_x * draw_w + draw_w * 0.5
-                                   + (double)gx * draw_w + pan_px_x;
-                    double tile_cy = center_y - viewer->anchor_y * draw_h + draw_h * 0.5
-                                   + (double)gy * draw_h + pan_px_y;
-
-                    /* SDL_RenderTextureRotated stretches the texture to
-                       fill dst, THEN rotates around the rect center.
-                       For a 90/270 rotation, the on-screen footprint
-                       gets swapped by the rotation — so we must build
-                       the pre-rotation dst with swapped dimensions so
-                       that the texture's natural aspect is preserved
-                       and the post-rotation footprint matches draw_w x
-                       draw_h. */
-                    SDL_FRect dst;
-                    if (quarter) {
-                        dst.w = (float)draw_h;
-                        dst.h = (float)draw_w;
-                    } else {
-                        dst.w = (float)draw_w;
-                        dst.h = (float)draw_h;
-                    }
-                    /* Center the rect on (tile_cx, tile_cy) regardless of
-                       which dimensions we chose; rotation is around the
-                       rect center, so the centroid stays put. */
-                    dst.x = (float)(tile_cx - (double)dst.w * 0.5);
-                    dst.y = (float)(tile_cy - (double)dst.h * 0.5);
-
-                    if (angle != 0.0 || flip != SDL_FLIP_NONE) {
-                        SDL_RenderTextureRotated(viewer->renderer,
-                                                 viewer->texture,
-                                                 NULL, &dst,
-                                                 angle, NULL, flip);
-                    } else {
-                        SDL_RenderTexture(viewer->renderer,
-                                          viewer->texture, NULL, &dst);
-                    }
+                /* For non-tile-mode SVG, overlay the sharp tile (if any)
+                   sharing the parent's transform pipeline. The overlay
+                   no-ops in tile mode and when the tile is invalid /
+                   stale, so the call is cheap and always safe. */
+                if (radius == 0) {
+                    svg_draw_tile_overlay(viewer,
+                                          tile_cx, tile_cy,
+                                          (double)dst.w, (double)dst.h,
+                                          angle, flip, quarter);
                 }
             }
         }
     }
+
 
     /* Compute a window-adaptive text size that grows/shrinks with the
        smaller window dimension. Soft clamps keep it readable on tiny
@@ -3253,29 +3399,12 @@ static void maybe_advance_anim(Viewer *viewer, bool *out_redraw) {
     }
 }
 
-/* If an SVG is dirty and the debounce window has elapsed since the last
-   dirty event, kick off a new raster job. Returns true if a job was
-   requested. */
-static bool maybe_request_svg_raster(Viewer *viewer) {
-    if (viewer->src.kind != IMG_SVG) return false;
-    SvgImage *svg = &viewer->src.v.svg;
-    if (!svg->dirty) return false;
-    Uint64 now = SDL_GetTicksNS();
-    if (now - svg->dirty_since_ns < SVG_DEBOUNCE_NS) return false;
-
-    int window_w = 1, window_h = 1;
-    SDL_GetCurrentRenderOutputSize(viewer->renderer, &window_w, &window_h);
-    SvgPlan want = svg_pick_plan(viewer, window_w, window_h);
-    svg_request(svg, &want);
-    svg->dirty = false;
-    return true;
-}
-
 /* Time (ms) until the next thing the event loop should wake up for:
    - next GIF frame
-   - SVG debounce expiry (if dirty)
-   - SVG worker job completion poll (if a job is in flight; this is just a
-     short ceiling so we don't sleep through a completion under low load)
+   - SVG: any state that needs render() ticked (debounce expiry,
+     worker completion). We just poll every ~30 ms when SVG state is
+     active — simpler than tracking deadlines, and the user perceives
+     no difference at that rate.
    Returns -1 if there's nothing to wait for. */
 static Sint32 time_until_next_wake_ms(const Viewer *viewer) {
     Sint32 best = -1;
@@ -3285,23 +3414,16 @@ static Sint32 time_until_next_wake_ms(const Viewer *viewer) {
 
     if (viewer->src.kind == IMG_SVG) {
         const SvgImage *svg = &viewer->src.v.svg;
-        if (svg->dirty) {
-            Uint64 now = SDL_GetTicksNS();
-            Uint64 due = svg->dirty_since_ns + SVG_DEBOUNCE_NS;
-            Sint32 ms = (due > now)
-                ? (Sint32)((due - now + 999999) / 1000000)
-                : 0;
-            if (best < 0 || ms < best) best = ms;
-        }
-        /* If a worker job is in flight or completed, poll every ~16ms so
-           we redraw shortly after it finishes. */
-        SDL_LockMutex(svg->mu);
-        bool in_flight = svg->job_pending || svg->job_done;
-        SDL_UnlockMutex(svg->mu);
-        if (in_flight) {
-            if (best < 0 || best > 16) best = 16;
+        bool need_request = !svg->tile_valid
+            || svg->tile_generation != svg->current_generation;
+        SDL_LockMutex(((SvgImage *)svg)->mu);
+        bool worker_busy = svg->job_pending || svg->job_done;
+        SDL_UnlockMutex(((SvgImage *)svg)->mu);
+        if (need_request || worker_busy) {
+            if (best < 0 || best > 30) best = 30;
         }
     }
+
     return best;
 }
 
@@ -3329,18 +3451,21 @@ static void event_loop(Viewer *viewer) {
         /* Advance any due GIF frames first so the timeout below is honest. */
         maybe_advance_anim(viewer, &redraw);
 
-        /* Kick off any due SVG raster job. */
-        if (maybe_request_svg_raster(viewer)) {
-            /* Don't redraw here; render() will pick up the result via
-               svg_try_consume on the next pass. */
-        }
-
-        /* Check for a freshly completed SVG raster regardless of events. */
+        /* For SVGs, while anything related is pending (we owe a sharp
+           tile, or the worker is busy / has delivered) just tick the
+           loop every ~30 ms and let render() drive the pipeline. Much
+           simpler than tracking precise debounce / completion wakeups,
+           and at 30 ms the user perceives no extra latency. */
         if (viewer->src.kind == IMG_SVG) {
-            SDL_LockMutex(viewer->src.v.svg.mu);
-            bool ready = viewer->src.v.svg.job_done;
-            SDL_UnlockMutex(viewer->src.v.svg.mu);
-            if (ready) redraw = true;
+            const SvgImage *svg = &viewer->src.v.svg;
+            bool need_request = !svg->tile_valid
+                || svg->tile_generation != svg->current_generation;
+            SDL_LockMutex(((SvgImage *)svg)->mu);
+            bool worker_busy = svg->job_pending || svg->job_done;
+            SDL_UnlockMutex(((SvgImage *)svg)->mu);
+            if (need_request || worker_busy) {
+                redraw = true;
+            }
         }
 
         SDL_Event event;

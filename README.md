@@ -11,7 +11,7 @@ fullscreen, animate, skim, and drag-drop files onto.
 - **Broad format support**: PNG, JPEG, TIFF, BMP, PSD, single-frame WebP,
   AVIF, PNM, HDR, EXR, TGA, etc. via GEGL; **animated GIF / APNG /
   animated WebP / animated AVIF** via gdk-pixbuf; **SVG** via librsvg,
-  re-rasterized on demand for crispness at any zoom.
+  rasterized once at load to a high-resolution texture.
 - **Aspect-locked window** that snaps back to the image's aspect during
   interactive resize, with a configurable letterbox fallback for tiled
   wms (white by default; override with `--bg`). Toggle with `a`.
@@ -209,17 +209,25 @@ reading the same hicolor files at startup. This works even without a
 | Animated WebP | yes       | gdk-pixbuf | needs webp loader pkg       |
 | Animated AVIF | yes       | gdk-pixbuf | needs avif loader pkg       |
 | Static WebP   | n/a       | GEGL       |                             |
-| SVG           | n/a       | librsvg    | vector; crisp at every zoom |
+| SVG           | n/a       | librsvg    | rasterized once at load     |
 
 ## Architecture notes
 
-- **SVG path** keeps a low-res whole-image "backdrop" rasterized once at
-  load, drawn beneath a high-quality clipped raster produced by a
-  dedicated worker thread on demand. A 60 ms debounce keeps fast wheel
-  / pan from queuing redundant work. Flips, rotation, and tile mode are
-  supported on SVGs: when any of those are active the worker switches
-  from "raster only the visible portion" to "raster the whole image",
-  so each rendered tile is sharp at the current per-tile scale.
+- **SVG path** uses a two-level pyramid:
+  - **Base raster**: rasterized once at load via librsvg, capped at
+    4096 px on the longest edge. Always uploaded as the main texture
+    and drawn first — the GPU handles bilinear scaling for resize,
+    pan, and modest zoom-in. This pass is *always* geometrically
+    correct, so even if the sharp tile lags or fails, the user sees
+    a valid (if slightly blurry) image.
+  - **Sharp tile**: a worker thread rasterizes the visible region at
+    the current zoom (capped at 4096 px) and overlays it on the base
+    after a brief debounce (80 ms after the last view change). Each
+    tile is stamped with a generation counter bumped on every view
+    change, and only drawn if its stamp matches the current view —
+    so tiles that finish for a stale view are silently discarded
+    rather than smeared across the new one. Tiles do not participate
+    in flip / rotation / tile-mode (those use the base only).
 - **Animated images** use SDL3's event-loop timeout to wake at each
   frame's delay; nothing polls. Pause/skim builds a lazy full-frame
   cache only when needed.
