@@ -2631,10 +2631,18 @@ static void svg_update_pyramid(Viewer *viewer, int window_w, int window_h,
        document the safe scale is small. Past the cap, the GPU
        bilinearly upscales the tile, which is imperceptibly different
        from a true vector raster at high zoom. */
+    /* Two caps: (1) doc_long * scale must fit cairo's max image
+       surface size (~32k px); (2) the scale itself must stay within
+       librsvg's numerical sanity. Empirically rsvg returns
+       InvalidSize past scale ~16 even on small documents (the
+       filter/group machinery scales internal buffers by the cairo
+       matrix). 16× the base is well past the point of useful sharper
+       detail anyway — GPU bilinear handles the rest. */
     double doc_long = svg->natural_w_f > svg->natural_h_f
                     ? svg->natural_w_f : svg->natural_h_f;
-    double safe_scale_cap = doc_long > 0.0 ? (28000.0 / doc_long) : 8.0;
-    if (safe_scale_cap < 1.0) safe_scale_cap = 1.0; /* always at least 1× */
+    double safe_scale_cap = doc_long > 0.0 ? (28000.0 / doc_long) : 16.0;
+    if (safe_scale_cap > 16.0) safe_scale_cap = 16.0;
+    if (safe_scale_cap < 1.0)  safe_scale_cap = 1.0;
     double render_scale = ppu; /* SVG-units to output-pixels */
     if (render_scale > safe_scale_cap) {
         render_scale = safe_scale_cap;
