@@ -129,8 +129,8 @@ typedef struct SvgImage {
     /* Snapshot of the view-affecting state at the last render, used to
        detect view changes without instrumenting every mutation site.
        When any of these change between frames, current_generation is
-       bumped (which invalidates the tile + flips dirty so a re-raster
-       will be queued after the debounce). */
+       bumped (which invalidates the tile and resets the debounce
+       timer so a re-raster will be queued after the window). */
     int    last_window_w, last_window_h;
     double last_zoom;
     double last_anchor_x, last_anchor_y;
@@ -151,13 +151,11 @@ typedef struct SvgImage {
     /* Debounce window: main thread sets dirty_since_ns on each view
        change; the request goes out only after the window elapses. */
     Uint64 dirty_since_ns;
-    /* The generation we last enqueued a request for. Compared against
-       current_generation to decide whether a new request is needed. */
+    /* Generation we last enqueued a request for. The request gate
+       skips re-queueing when last_requested_generation matches
+       current_generation. */
     bool   has_last_requested;
     Uint64 last_requested_generation;
-    double last_requested_ix, last_requested_iy;
-    double last_requested_iw, last_requested_ih;
-    int    last_requested_out_w, last_requested_out_h;
 
     /* Two-buffer pipeline. The worker renders into `worker_rgba`; when
        it finishes it swaps `worker_rgba` <-> `delivered_rgba` under the
@@ -583,13 +581,13 @@ static bool svg_render_region(RsvgHandle *handle,
         natural_w <= 0.0 || natural_h <= 0.0) {
         return false;
     }
-    /* Zero the destination so any uncovered pixels are transparent. */
-    memset(dst, 0, (size_t)out_w * (size_t)out_h * 4u);
 
     int stride = cairo_format_stride_for_width(CAIRO_FORMAT_ARGB32, out_w);
     /* We allocated exactly out_w * 4 bytes per row, but cairo may want
        padding. If stride doesn't match, render into a separate cairo
-       buffer and copy out. The common case (no padding) is fast-path. */
+       buffer and copy out (rare; cairo's stride is row-padded to a
+       4-byte multiple, which our 4-byte pixels already satisfy except
+       at pathologically odd widths). */
     cairo_surface_t *surface;
     unsigned char *cbuf = NULL;
     bool need_copy = (stride != out_w * 4);
@@ -599,6 +597,11 @@ static bool svg_render_region(RsvgHandle *handle,
         surface = cairo_image_surface_create_for_data(
             cbuf, CAIRO_FORMAT_ARGB32, out_w, out_h, stride);
     } else {
+        /* Zero dst so any uncovered pixels (e.g. SVG with transparent
+           areas) start transparent. cairo composites with OVER by
+           default, so untouched pixels would otherwise keep stale
+           bytes from a previous tile. */
+        memset(dst, 0, (size_t)out_w * (size_t)out_h * 4u);
         surface = cairo_image_surface_create_for_data(
             dst, CAIRO_FORMAT_ARGB32, out_w, out_h, stride);
     }
@@ -695,16 +698,13 @@ static bool svg_get_natural_size(RsvgHandle *handle,
     return true;
 }
 
-/* Load an SVG, rasterize it once at its natural size (clamped to
-   SVG_MAX_RASTER_DIM on the longest edge), and store the resulting
-   RGBA buffer in *out. Returns true on success. After this returns,
-   the renderer treats the SVG identically to a static raster image
-   — there is no worker thread, no re-rasterization on zoom, and the
-   GPU handles upscaling beyond natural size via bilinear filtering. */
-/* Worker thread: pull pending job, render to done_rgba, signal job_done
-   with the stamped generation. Worker holds the lock only at start and
-   end of each job; the cairo render itself runs without the lock so
-   the main thread can keep updating pending_* without blocking. */
+/* Worker thread: wait on the condvar for a pending job, snapshot it
+   under the mutex, then run the cairo render with the mutex
+   released (so the main thread can keep overwriting pending_*
+   without blocking). On success, swap worker_rgba <-> delivered_rgba
+   under the mutex, set job_done. On failure, set job_done with
+   done_out_w/h = 0 to signal an empty result. Generation is stamped
+   on every delivery so the main thread can discard stale results. */
 static int svg_worker_main(void *userdata) {
     SvgImage *svg = (SvgImage *)userdata;
     for (;;) {
@@ -815,10 +815,6 @@ static void svg_request_tile(SvgImage *svg, Uint64 gen,
 
     svg->has_last_requested = true;
     svg->last_requested_generation = gen;
-    svg->last_requested_ix = ix; svg->last_requested_iy = iy;
-    svg->last_requested_iw = iw; svg->last_requested_ih = ih;
-    svg->last_requested_out_w = out_w;
-    svg->last_requested_out_h = out_h;
 }
 
 static bool svg_start_worker(SvgImage *svg) {
@@ -1764,11 +1760,12 @@ static bool create_sdl(Viewer *viewer, const char *title) {
         cairo_font_options_destroy(fo);
     }
 
-    /* For static and GIF: create a texture at natural size and upload the
-       first frame. For SVG: defer; the texture is recreated lazily at
-       the actually-rendered size on each render. With no image loaded,
-       skip texture setup; the blank window simply paints the background
-       color. */
+    /* For static, GIF, and SVG: create the base texture at natural
+       size and upload its pixels. SVGs use the same upload path
+       because load_svg already rasterized the base raster (the
+       sharp-tile pyramid then adds an overlay on top). With no
+       image loaded, skip texture setup; the blank window simply
+       paints the background color. */
     if (viewer->src.width <= 0 || viewer->src.height <= 0) {
         rebuild_info_lines(viewer);
         return true;
@@ -2506,12 +2503,15 @@ static bool svg_view_changed(SvgImage *svg, int window_w, int window_h,
 
 /* Maintain the SVG sharp-tile pyramid for this frame:
    - Detect view-state changes and bump generation accordingly.
-   - Decide whether a sharp tile is wanted (only when zoomed in past
-     base sharpness AND not in whole-image transform mode).
-   - Queue a worker request after the debounce window if so.
-   - Claim any finished worker buffer that matches the current
-     generation, uploading it into svg->tile_tex.
-   Called near the top of render(), before the texture draw block. */
+   - Decide whether a sharp tile is wanted (skipped in tile-mode, and
+     when current zoom doesn't exceed base resolution).
+   - Queue a worker request after the debounce window elapses.
+   - Claim any finished worker buffer matching the current generation
+     and upload it into svg->tile_tex.
+   Called near the top of render(), before the texture draw block.
+   Rotation and flip are handled by svg_draw_tile_overlay using the
+   parent's transform pipeline; the worker always rasterizes in
+   un-transformed image space. */
 static void svg_update_pyramid(Viewer *viewer, int window_w, int window_h,
                                double draw_w, double draw_h) {
     if (viewer->src.kind != IMG_SVG) return;
@@ -2530,9 +2530,8 @@ static void svg_update_pyramid(Viewer *viewer, int window_w, int window_h,
         return;
     }
 
-    int eff_w = viewer->src.width;
-    int eff_h = viewer->src.height;
-    if (eff_w < 1 || eff_h < 1 || draw_w < 1.0 || draw_h < 1.0) return;
+    if (viewer->src.width < 1 || viewer->src.height < 1
+        || draw_w < 1.0 || draw_h < 1.0) return;
 
     /* For rotated/flipped views we conservatively raster the whole
        image rather than computing a rotated-visibility intersection
@@ -3407,29 +3406,31 @@ static void maybe_advance_anim(Viewer *viewer, bool *out_redraw) {
     }
 }
 
-/* Time (ms) until the next thing the event loop should wake up for:
-   - next GIF frame
-   - SVG: any state that needs render() ticked (debounce expiry,
-     worker completion). We just poll every ~30 ms when SVG state is
-     active — simpler than tracking deadlines, and the user perceives
-     no difference at that rate.
-   Returns -1 if there's nothing to wait for. */
-static Sint32 time_until_next_wake_ms(const Viewer *viewer) {
+/* True if the SVG pipeline has unfinished business — we owe a sharp
+   tile for the current generation, or the worker is in flight, or
+   it's delivered one we haven't picked up yet. While true, the event
+   loop wants a periodic tick so render() can drive the pipeline. */
+static bool svg_pipeline_pending(Viewer *viewer) {
+    if (viewer->src.kind != IMG_SVG) return false;
+    SvgImage *svg = &viewer->src.v.svg;
+    bool need_request = !svg->tile_valid
+        || svg->tile_generation != svg->current_generation;
+    SDL_LockMutex(svg->mu);
+    bool worker_busy = svg->job_pending || svg->job_done;
+    SDL_UnlockMutex(svg->mu);
+    return need_request || worker_busy;
+}
+
+/* Time (ms) until the event loop should wake. Negative = wait forever
+   (no animation, no SVG pipeline work). */
+static Sint32 time_until_next_wake_ms(Viewer *viewer) {
     Sint32 best = -1;
 
     Sint32 anim_ms = time_until_next_anim_frame_ms(viewer);
     if (anim_ms >= 0 && (best < 0 || anim_ms < best)) best = anim_ms;
 
-    if (viewer->src.kind == IMG_SVG) {
-        const SvgImage *svg = &viewer->src.v.svg;
-        bool need_request = !svg->tile_valid
-            || svg->tile_generation != svg->current_generation;
-        SDL_LockMutex(((SvgImage *)svg)->mu);
-        bool worker_busy = svg->job_pending || svg->job_done;
-        SDL_UnlockMutex(((SvgImage *)svg)->mu);
-        if (need_request || worker_busy) {
-            if (best < 0 || best > 30) best = 30;
-        }
+    if (svg_pipeline_pending(viewer)) {
+        if (best < 0 || best > 30) best = 30;
     }
 
     return best;
@@ -3459,22 +3460,9 @@ static void event_loop(Viewer *viewer) {
         /* Advance any due GIF frames first so the timeout below is honest. */
         maybe_advance_anim(viewer, &redraw);
 
-        /* For SVGs, while anything related is pending (we owe a sharp
-           tile, or the worker is busy / has delivered) just tick the
-           loop every ~30 ms and let render() drive the pipeline. Much
-           simpler than tracking precise debounce / completion wakeups,
-           and at 30 ms the user perceives no extra latency. */
-        if (viewer->src.kind == IMG_SVG) {
-            const SvgImage *svg = &viewer->src.v.svg;
-            bool need_request = !svg->tile_valid
-                || svg->tile_generation != svg->current_generation;
-            SDL_LockMutex(((SvgImage *)svg)->mu);
-            bool worker_busy = svg->job_pending || svg->job_done;
-            SDL_UnlockMutex(((SvgImage *)svg)->mu);
-            if (need_request || worker_busy) {
-                redraw = true;
-            }
-        }
+        /* Tick render() at ~30 Hz while SVG pipeline work is pending
+           so it can drive the worker and pick up finished tiles. */
+        if (svg_pipeline_pending(viewer)) redraw = true;
 
         SDL_Event event;
         Sint32 timeout = time_until_next_wake_ms(viewer);
