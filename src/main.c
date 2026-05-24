@@ -29,7 +29,9 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <math.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -37,6 +39,8 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #define APP_NAME    "weh"
 #define APP_TITLE   "weh"
@@ -354,6 +358,7 @@ static void print_usage(FILE *stream) {
         "  -  /  =            Step to previous / next frame (animated images only)\n"
         "  , / .              Previous / next image in playlist (with wrap)\n"
         "  Home / End         First / last image in playlist\n"
+        "  Ctrl+c             Copy current image to clipboard\n"
         "  q, Esc             Quit\n"
         "  Mouse wheel        Zoom in/out (anchors on the panned-to point)\n"
         "  Left-drag          Pan\n"
@@ -2439,6 +2444,188 @@ static bool draw_text(Viewer *viewer, float x, float y,
 
 
 
+/* ---------- Clipboard ----------
+
+   Ctrl+c puts the current image file on the system clipboard the way a
+   file manager does: a single `text/uri-list` entry pointing at the
+   file on disk. Pasting into Discord / browsers / chat clients then
+   behaves exactly like pasting a file copied from Dolphin — a file
+   attachment with the original filename and full data, animation
+   preserved, no transcoding.
+
+   The payload is piped into `wl-copy` (Wayland) or `xclip` (X11) on
+   stdin. To avoid blocking the UI thread and to let the helper outlive
+   weh, three processes are involved:
+
+       weh ── fork ──> writer ── fork ──> helper
+                       │                  │
+                       └── pipe ─────────>┘
+
+   The writer creates the pipe, spawns the helper, writes the payload,
+   then exits. The helper calls setsid() so it reparents to init and
+   keeps serving the clipboard selection after weh quits. weh only
+   waits briefly on the writer, never on the helper. */
+
+/* True if `prog` is found on $PATH. */
+static bool clipboard_have_helper(const char *prog) {
+    const char *path = getenv("PATH");
+    if (!path || !*path) return false;
+    size_t plen = strlen(prog);
+    for (const char *p = path; *p; ) {
+        const char *colon = strchr(p, ':');
+        size_t dlen = colon ? (size_t)(colon - p) : strlen(p);
+        char buf[4096];
+        if (dlen > 0 && dlen + 1 + plen + 1 <= sizeof(buf)) {
+            memcpy(buf, p, dlen);
+            buf[dlen] = '/';
+            memcpy(buf + dlen + 1, prog, plen + 1);
+            if (access(buf, X_OK) == 0) return true;
+        }
+        if (!colon) break;
+        p = colon + 1;
+    }
+    return false;
+}
+
+/* Run `argv[0]` with stdin = `payload`, fully detached from weh. See
+   the section comment above for the writer/helper design. */
+static bool clipboard_run_helper(char *const argv[],
+                                 const char *payload, size_t len) {
+    pid_t writer = fork();
+    if (writer < 0) return false;
+    if (writer == 0) {
+        signal(SIGPIPE, SIG_IGN);
+
+        int pfd[2];
+        if (pipe(pfd) != 0) _exit(1);
+
+        pid_t helper = fork();
+        if (helper < 0) _exit(1);
+        if (helper == 0) {
+            /* Helper: stdin = read end of pipe; new session so it
+               survives weh exiting; silence stdout/stderr. */
+            setsid();
+            dup2(pfd[0], STDIN_FILENO);
+            close(pfd[0]); close(pfd[1]);
+
+            int devnull = open("/dev/null", O_WRONLY | O_CLOEXEC);
+            if (devnull >= 0) {
+                dup2(devnull, STDOUT_FILENO);
+                dup2(devnull, STDERR_FILENO);
+                close(devnull);
+            }
+            execvp(argv[0], argv);
+            _exit(127);
+        }
+
+        /* Writer: drain payload into the pipe, then close to signal EOF. */
+        close(pfd[0]);
+        size_t off = 0;
+        while (off < len) {
+            ssize_t n = write(pfd[1], payload + off, len - off);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            off += (size_t)n;
+        }
+        close(pfd[1]);
+        _exit(off == len ? 0 : 1);
+    }
+
+    waitpid(writer, NULL, 0);
+    return true;
+}
+
+/* Build a `text/uri-list` payload for a single file: one `file://` URI
+   plus CRLF. Bytes that aren't RFC 3986 unreserved chars (or '/') are
+   percent-encoded so paths with spaces or non-ASCII survive intact.
+   Caller frees. */
+static char *clipboard_build_uri_list(const char *path, size_t *out_len) {
+    /* Resolve to absolute so the URI is meaningful regardless of the
+       paste target's cwd. realpath handles relative + existing files;
+       if it fails (e.g. unsearchable parent), we fall back to a literal
+       absolute path or strdup. */
+    char *abs = NULL;
+    if (path[0] == '/') {
+        abs = strdup(path);
+    } else {
+        abs = realpath(path, NULL);
+        if (!abs) {
+            char cwd[4096];
+            if (getcwd(cwd, sizeof(cwd))) {
+                size_t n = strlen(cwd) + 1 + strlen(path) + 1;
+                abs = malloc(n);
+                if (abs) snprintf(abs, n, "%s/%s", cwd, path);
+            }
+        }
+    }
+    if (!abs) return NULL;
+
+    static const char hex[] = "0123456789ABCDEF";
+    size_t alen = strlen(abs);
+    /* "file://" + (max 3x expansion per byte) + CRLF + NUL. */
+    char *out = malloc(7 + alen * 3 + 2 + 1);
+    if (!out) { free(abs); return NULL; }
+
+    size_t i = 0;
+    memcpy(out + i, "file://", 7); i += 7;
+    for (size_t k = 0; k < alen; k++) {
+        unsigned char c = (unsigned char)abs[k];
+        bool unreserved =
+            (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '~' || c == '/';
+        if (unreserved) {
+            out[i++] = (char)c;
+        } else {
+            out[i++] = '%';
+            out[i++] = hex[c >> 4];
+            out[i++] = hex[c & 0xF];
+        }
+    }
+    out[i++] = '\r';
+    out[i++] = '\n';
+    free(abs);
+    *out_len = i;
+    return out;
+}
+
+/* Ctrl+c entry point. Returns true on success. */
+static bool copy_image_to_clipboard(const Viewer *viewer) {
+    if (!viewer || !viewer->current_path) return false;
+
+    /* Helper selection. SDL's current video driver wins so --x11 and
+       --wayland behave consistently with the rest of weh. We still
+       cross-fall-back: under XWayland, wl-copy works fine; on a pure
+       X11 session with only wl-clipboard installed, it would not. */
+    const char *vd = SDL_GetCurrentVideoDriver();
+    bool prefer_wayland = vd ? (strcmp(vd, "wayland") == 0)
+                             : (getenv("WAYLAND_DISPLAY") != NULL);
+    bool have_wl = clipboard_have_helper("wl-copy");
+    bool have_xc = clipboard_have_helper("xclip");
+
+    char *wl_argv[] = {
+        (char *)"wl-copy", (char *)"--type", (char *)"text/uri-list", NULL
+    };
+    char *xc_argv[] = {
+        (char *)"xclip", (char *)"-selection", (char *)"clipboard",
+        (char *)"-t",    (char *)"text/uri-list", NULL
+    };
+    char **argv;
+    if      (prefer_wayland && have_wl) argv = wl_argv;
+    else if (have_xc)                   argv = xc_argv;
+    else if (have_wl)                   argv = wl_argv;
+    else                                return false;
+
+    size_t len = 0;
+    char *payload = clipboard_build_uri_list(viewer->current_path, &len);
+    if (!payload) return false;
+    bool ok = clipboard_run_helper(argv, payload, len);
+    free(payload);
+    return ok;
+}
+
 /* The keybinds cheat-sheet. Each entry is a (key, description) pair. */
 typedef struct BindEntry {
     const char *key;
@@ -2460,6 +2647,7 @@ static const BindEntry BINDS[] = {
     {"- / =",     "Previous / next animation frame"},
     {", / .",     "Previous / next image in playlist"},
     {"Home / End", "First / last image in playlist"},
+    {"Ctrl+c",    "Copy current image to clipboard"},
     {"Wheel",     "Zoom in/out"},
     {"Drag",      "Pan"},
     {"q / Esc",   "Quit"},
@@ -3550,6 +3738,7 @@ static void event_loop(Viewer *viewer) {
 
                 case SDL_EVENT_KEY_DOWN: {
                     SDL_Keycode key = event.key.key;
+                    bool ctrl = (event.key.mod & SDL_KMOD_CTRL) != 0;
                     /* Most keys are one-shot; ignore OS key-repeat for them.
                        Frame-skim and directory navigation feel better with
                        auto-repeat so the user can hold to scrub or page. */
@@ -3557,6 +3746,16 @@ static void event_loop(Viewer *viewer) {
                                          key == SDLK_EQUALS ||
                                          key == SDLK_COMMA ||
                                          key == SDLK_PERIOD);
+                    if ((!event.key.repeat || allow_repeat) && ctrl) {
+                        /* Modifier combos. Handled separately so the
+                           bare-key switch below doesn't accidentally fire
+                           on e.g. Ctrl+H (which some users hit thinking it
+                           opens a help dialog). */
+                        if (key == SDLK_C) {
+                            copy_image_to_clipboard(viewer);
+                        }
+                        break;
+                    }
                     if (!event.key.repeat || allow_repeat) {
                         switch (key) {
                         case SDLK_ESCAPE:

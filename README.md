@@ -28,6 +28,10 @@ fullscreen, animate, skim, and drag-drop files onto.
 - **Info overlay:** toggle with `i` to see path, size, dimensions,
   format, animation status, current frame, and zoom level.
 - **Binds overlay:** Display all keybinds with the `b` key
+- **Copy to clipboard:** `Ctrl+c` hands the current image file to the system
+  clipboard. Uses Klipper on KDE Plasma, `wl-copy` on Wayland, and
+  `xclip` on X11. Animated formats (GIF / APNG / animated WebP) keep
+  their animation because the raw file bytes are handed off.
 
 ## Build
 
@@ -150,6 +154,7 @@ See `weh --help` and `man weh` for the full reference.
 | `=`               | Next animation frame                                         |
 | `,` / `.`         | Previous / next image in playlist (wraps)                    |
 | `Home` / `End`    | First / last image in playlist                               |
+| `Ctrl`+`c`        | Copy current image to clipboard (Klipper / wl-copy / xclip)  |
 | `q` or `Esc`      | Quit                                                         |
 | Mouse wheel       | Zoom in/out (anchors on the panned-to point)                 |
 | Left-drag         | Pan (1:1 with cursor)                                        |

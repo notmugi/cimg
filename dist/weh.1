@@ -178,6 +178,23 @@ is drag-dropped.
 .B Home / End
 Jump to the first / last image in the directory list.
 .TP
+.B Ctrl+c
+Copy the currently-displayed image to the system clipboard. The raw
+file bytes are handed off, so animated formats (GIF, APNG, animated
+WebP) retain their animation when pasted into another viewer.
+On KDE Plasma sessions
+.B qdbus
+is used to push the image into Klipper (so it integrates with the
+clipboard history). Otherwise, on Wayland sessions
+.BR wl-copy (1)
+is used, and on X11 sessions
+.BR xclip (1)
+is used. Install the matching helper package
+.RB ( wl-clipboard
+or
+.BR xclip )
+if no helper is found.
+.TP
 .BR q ", " Esc
 Quit.
 .TP
